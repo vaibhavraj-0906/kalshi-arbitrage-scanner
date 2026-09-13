@@ -1,0 +1,87 @@
+{
+  "captured_at": "2026-09-13T07:20:36+00:00",
+  "events": {
+    "KXBTCD-26SEP1304": {
+      "exclusion": null,
+      "fees": "quadratic x1",
+      "integrity": [],
+      "kind": "interval",
+      "lp_found": {
+        "LOGICAL": false
+      },
+      "markets": 188,
+      "mutually_exclusive": false,
+      "opportunities": [],
+      "screen_hits": [],
+      "spaces": {
+        "LOGICAL": {
+          "atoms": 377,
+          "grid": null,
+          "holes": 2,
+          "overlaps": 373,
+          "partition": false
+        }
+      },
+      "tradeable": 188
+    },
+    "KXELONMARS-99": {
+      "exclusion": "fewer than two markets",
+      "markets": 1,
+      "mutually_exclusive": false
+    },
+    "KXINX-26SEP14H1600": {
+      "exclusion": null,
+      "fees": "quadratic x1",
+      "integrity": [],
+      "kind": "interval",
+      "lp_found": {
+        "LOGICAL": false,
+        "STRUCTURAL": false
+      },
+      "markets": 30,
+      "mutually_exclusive": true,
+      "opportunities": [],
+      "screen_hits": [],
+      "spaces": {
+        "LOGICAL": {
+          "atoms": 113,
+          "grid": null,
+          "holes": 27,
+          "overlaps": 0,
+          "partition": false
+        },
+        "STRUCTURAL": {
+          "atoms": 86,
+          "grid": "0.0001",
+          "holes": 0,
+          "overlaps": 0,
+          "partition": true
+        }
+      },
+      "tradeable": 30
+    },
+    "KXNEXTDNCCHAIR-45": {
+      "exclusion": null,
+      "fees": "quadratic x1",
+      "integrity": [],
+      "kind": "categorical",
+      "lp_found": {
+        "LOGICAL": false
+      },
+      "markets": 34,
+      "mutually_exclusive": true,
+      "opportunities": [],
+      "screen_hits": [],
+      "spaces": {
+        "LOGICAL": {
+          "atoms": 35,
+          "grid": null,
+          "holes": 1,
+          "overlaps": 0,
+          "partition": false
+        }
+      },
+      "tradeable": 34
+    }
+  }
+}

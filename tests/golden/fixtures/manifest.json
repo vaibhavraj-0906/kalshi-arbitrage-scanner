@@ -1,0 +1,16 @@
+{
+  "captured_at": "2026-09-13T07:20:36Z",
+  "base_url": "https://api.elections.kalshi.com/trade-api/v2",
+  "files": [
+    "event_KXELONMARS-99.json",
+    "event_KXNEXTDNCCHAIR-45.json",
+    "events_KXBTCD.json",
+    "events_KXINX.json",
+    "exchange_status.json",
+    "markets_page.json",
+    "orderbooks_KXBTCD.json",
+    "orderbooks_KXINX.json",
+    "orderbooks_KXNEXTDNCCHAIR-45.json",
+    "series_subset.json"
+  ]
+}
