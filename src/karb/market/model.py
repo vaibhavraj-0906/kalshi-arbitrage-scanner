@@ -22,6 +22,7 @@ __all__ = [
     "Quote",
     "SeriesInfo",
     "event_from_wire",
+    "listed_price",
     "market_from_wire",
     "series_from_wire",
 ]
@@ -58,6 +59,15 @@ class Quote:
 
 def _present(price: Price) -> Price | None:
     return price if 0 < price.raw < PRICE_SCALE else None
+
+
+def listed_price(text: str) -> Price | None:
+    """A quote from a market listing or a candle, where $0 and $1 both mean "no quote".
+
+    Listings report a missing ask as 0.0000 and candles report it as 1.0000. Neither is ever a
+    real quote: a YES ask of $0 would be a free contract, and a YES bid of $1 a pointless one.
+    """
+    return _present(Price.parse(text))
 
 
 @dataclass(frozen=True, slots=True)

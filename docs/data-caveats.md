@@ -104,6 +104,33 @@ Everything here was checked against the live API and documentation on 2026-09-13
     by participant turned them into 15,959 groups, of which 12,119 were scannable: 7,357 interval
     and 4,762 categorical, with 172 carrying a STRUCTURAL tier.
 
+## Recordings and history
+
+- **Replay reproduces detection, not screening.** Recordings keep each confirmation's books,
+  event payloads and tradeable markets, but not the Tier B listing refreshes that drive the
+  screens. Recorded screen hits are reported as they happened; they cannot be recomputed under
+  new rules.
+- **Fees are as of discovery.** Observations store the series fee type and multiplier loaded at
+  the latest discovery. A mid-run fee change appears from the next discovery.
+- **Lifetimes are lower bounds, twice over.**
+  - An episode is observed only when its group is confirmed: every ~5 s plus fetch time.
+  - Only groups on the watchlist or hit by a screen are confirmed at all.
+  - Episodes still live at their group's last observation are marked censored.
+- **One writer per file.** DuckDB locks a database for writing. Stop `karb scan --record` before
+  running `karb stats` against the same file, or read a copy.
+- **Candles are coarse.** On 2026-09-13, `GET /markets/candlesticks` behaved as follows:
+  - **Sparse.** It returned one candle per minute *with activity*; quiet minutes are simply
+    absent.
+  - **No sizes.** Each candle has YES bid and ask OHLC, but no sizes.
+  - **Missing asks.** A missing ask is encoded as `1.0000`, where listings use `0.0000`.
+
+  `karb history` carries each market's last close forward through quiet minutes, so a market that
+  stops trading keeps its last quote. A historical hit is a pre-fee, top-of-book necessary
+  condition; nothing about depth or executability can be inferred from it.
+- **Settled history needs another endpoint.** Markets settled before Kalshi's historical cutoff
+  are served by `/historical/markets/{ticker}/candlesticks`, which `karb history` does not use
+  yet.
+
 ## Capital and settlement
 
 - **Capital is gross cash outlay.**

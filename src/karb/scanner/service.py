@@ -33,13 +33,14 @@ from karb.exchange.endpoints import (
     fetch_exchange_status,
     fetch_orderbooks,
     fetch_series,
-    iter_events,
+    iter_event_payloads,
     iter_market_listings,
     pack_batches,
     trading_shards,
 )
 from karb.market.book import OrderBook
-from karb.market.model import EventInfo, MarketInfo
+from karb.market.model import EventInfo, MarketInfo, SeriesInfo
+from karb.store.codec import dumps_exact, structural_payload
 from karb.structure.classify import (
     DEFAULT_TRADEABILITY,
     EventStructure,
@@ -102,12 +103,16 @@ class Universe:
 class CycleReport:
     started_at: datetime
     finished_at: datetime
+    rescreened: bool
+    """Whether this cycle re-ran the screens; otherwise ``hits`` are an earlier cycle's."""
     screened: int
     """Eligible events with at least two tradeable markets."""
     untradeable: int
     hits: dict[str, list[ScreenHit]]
     targets: list[str]
     detections: dict[str, Detection]
+    snapshots: dict[str, EventSnapshot] = field(default_factory=dict)
+    """The exact inputs behind each detection: what a recorder writes and a replay rebuilds."""
     fetch_errors: list[str] = field(default_factory=list)
 
     @property
@@ -127,14 +132,19 @@ class Scanner:
         *,
         progress: Progress | None = None,
         sleep: Sleep | None = None,
+        record_payloads: bool = False,
     ) -> None:
         self.client = client
         self.config = config or ScanConfig()
         self.progress: Progress = progress or (lambda _message: None)
         self._sleep: Sleep = sleep or asyncio.sleep
+        self.record_payloads = record_payloads
         self.tracker = OpportunityTracker(self.config.confirmations)
         self.skips = SkipLog()
         self.universe: Universe | None = None
+        self.series: dict[str, SeriesInfo] = {}
+        self.event_payloads: dict[str, str] = {}
+        """Structural JSON per event ticker, kept only with ``record_payloads`` (ADR-0007)."""
         self._hits: dict[str, list[ScreenHit]] = {}
         self._targets: list[str] = []
         self._screened = 0
@@ -161,12 +171,16 @@ class Scanner:
         series = await fetch_series(self.client, self.skips)
 
         events: dict[str, EventInfo] = {}
+        payloads: dict[str, str] = {}
         scopes: Sequence[str | None] = config.series or (None,)
         for scope in scopes:
-            async for event in iter_events(
+            async for event, raw in iter_event_payloads(
                 self.client, series_ticker=scope, max_pages=config.max_event_pages, skips=self.skips
             ):
                 events[event.event_ticker] = event
+                if self.record_payloads:
+                    # Serialised immediately: thousands of events are far lighter as strings.
+                    payloads[event.event_ticker] = dumps_exact(structural_payload(raw))
                 if len(events) % 500 == 0:
                     self.progress(f"Discovered {len(events):,} open events")
 
@@ -188,6 +202,8 @@ class Scanner:
                     result.exclusion, f"{group.event_ticker} {result.detail}".strip()
                 )
 
+        self.series = series
+        self.event_payloads = payloads
         self.universe = Universe(
             discovered_at=self.client.clock.now(),
             events_seen=len(events),
@@ -240,7 +256,10 @@ class Scanner:
 
     # --- Tier C ------------------------------------------------------------------------------
 
-    async def confirm(self, targets: Sequence[str]) -> tuple[dict[str, Detection], list[str]]:
+    async def confirm(
+        self, targets: Sequence[str]
+    ) -> tuple[dict[str, Detection], dict[str, EventSnapshot], list[str]]:
+        """Detections and the snapshots behind them, by group, plus any fetch errors."""
         universe = self._require_universe()
         now = self.client.clock.now()
         plans: list[tuple[EventStructure, frozenset[str]]] = []
@@ -257,6 +276,7 @@ class Scanner:
         )
         observed_at = self.client.clock.now()
         detections: dict[str, Detection] = {}
+        snapshots: dict[str, EventSnapshot] = {}
         for structure, tradeable in plans:
             spans = [timing[ticker] for ticker in tradeable if ticker in timing]
             if not spans:
@@ -273,7 +293,8 @@ class Scanner:
             key = structure.event.event_ticker
             self.tracker.observe(key, detection.opportunities, observed_at)
             detections[key] = detection
-        return detections, errors
+            snapshots[key] = snapshot
+        return detections, snapshots, errors
 
     async def _fetch_books(
         self, batches: list[list[str]]
@@ -307,28 +328,40 @@ class Scanner:
 
     async def cycle(self, *, rescreen: bool) -> CycleReport:
         started = self.client.clock.now()
-        if rescreen or not self._targets:
+        rescreened = rescreen or not self._targets
+        if rescreened:
             self._hits, self._targets, self._screened, self._untradeable = self.screen(started)
         self.progress(f"Confirming books for {len(self._targets):,} event groups")
-        detections, errors = await self.confirm(self._targets)
+        detections, snapshots, errors = await self.confirm(self._targets)
         return CycleReport(
             started_at=started,
             finished_at=self.client.clock.now(),
+            rescreened=rescreened,
             screened=self._screened,
             untradeable=self._untradeable,
             hits=self._hits,
             targets=list(self._targets),
             detections=detections,
+            snapshots=snapshots,
             fetch_errors=errors,
         )
 
-    async def run_once(self) -> CycleReport:
-        """Discover, screen, then confirm ``confirmations`` times in a row."""
+    async def run_once(
+        self, on_cycle: Callable[[CycleReport], object] | None = None
+    ) -> CycleReport:
+        """Discover, screen, then confirm ``confirmations`` times in a row.
+
+        ``on_cycle`` sees every cycle's report, not only the last: a recorder needs them all.
+        """
         await self.discover()
         report = await self.cycle(rescreen=True)
+        if on_cycle is not None:
+            on_cycle(report)
         for _ in range(self.config.confirmations - 1):
             await self._sleep(self.config.confirm_interval)
             report = await self.cycle(rescreen=False)
+            if on_cycle is not None:
+                on_cycle(report)
         return report
 
     async def run_forever(self, on_cycle: Callable[[CycleReport], object]) -> None:

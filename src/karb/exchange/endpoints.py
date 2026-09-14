@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Any, Final
 
 from pydantic import ValidationError
 
@@ -44,6 +44,7 @@ __all__ = [
     "fetch_one_series",
     "fetch_orderbooks",
     "fetch_series",
+    "iter_event_payloads",
     "iter_events",
     "iter_market_listings",
     "pack_batches",
@@ -112,15 +113,19 @@ async def fetch_one_series(client: KalshiClient, series_ticker: str) -> SeriesIn
     return series_from_wire(SeriesWire.model_validate(payload["series"]))
 
 
-async def iter_events(
+async def iter_event_payloads(
     client: KalshiClient,
     *,
     status: str = "open",
     series_ticker: str | None = None,
     max_pages: int | None = None,
     skips: SkipLog | None = None,
-) -> AsyncIterator[EventInfo]:
-    """Events with their markets nested. ``/events`` excludes multivariate events."""
+) -> AsyncIterator[tuple[EventInfo, dict[str, Any]]]:
+    """Events with their markets nested, each with the raw payload it was decoded from.
+
+    Recording keeps the payload rather than the decoded event, because classification evolves
+    and a replay must be able to re-read fields today's model ignores (ADR-0007).
+    """
     params: list[tuple[str, str | int]] = [
         ("status", status),
         ("with_nested_markets", "true"),
@@ -131,10 +136,27 @@ async def iter_events(
     async for page in client.paginate("/events", params, "events", max_pages=max_pages):
         for raw in page:
             try:
-                yield event_from_wire(EventWire.model_validate(raw))
+                event = event_from_wire(EventWire.model_validate(raw))
             except (ValidationError, FixedPointError) as exc:
                 if skips is not None:
                     skips.record("event", f"{_ticker(raw, 'event_ticker')}: {exc}")
+                continue
+            yield event, raw
+
+
+async def iter_events(
+    client: KalshiClient,
+    *,
+    status: str = "open",
+    series_ticker: str | None = None,
+    max_pages: int | None = None,
+    skips: SkipLog | None = None,
+) -> AsyncIterator[EventInfo]:
+    """Events with their markets nested. ``/events`` excludes multivariate events."""
+    async for event, _payload in iter_event_payloads(
+        client, status=status, series_ticker=series_ticker, max_pages=max_pages, skips=skips
+    ):
+        yield event
 
 
 async def fetch_event(client: KalshiClient, event_ticker: str) -> EventInfo:
