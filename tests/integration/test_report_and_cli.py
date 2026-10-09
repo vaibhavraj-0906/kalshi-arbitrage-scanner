@@ -87,6 +87,7 @@ async def test_research_commands(tmp_path: Path) -> None:
 
 
 def test_paper_needs_a_recording() -> None:
-    result = runner.invoke(app, ["scan", "--paper", "--once"])
+    result = runner.invoke(app, ["scan", "--paper", "--once"], env={"COLUMNS": "200"})
     assert result.exit_code != 0
-    assert "--record" in result.output
+    # Typer forces colour under GitHub Actions, so strip the escape codes first.
+    assert "--paper needs --record" in re.sub(r"\x1b\[[0-9;]*m", "", result.output)
