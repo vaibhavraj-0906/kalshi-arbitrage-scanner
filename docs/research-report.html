@@ -1,0 +1,122 @@
+<!doctype html><html lang=en><head><meta charset=utf-8><meta name="viewport" content="width=device-width, initial-scale=1"><title>karb report 20261009T163436Z-a9c3db</title><style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --series-1: #2a78d6; --gain: #2a78d6; --loss: #e34948; --total: #898781;
+  --stage-1: #86b6ef; --stage-2: #5598e7; --stage-3: #2a78d6; --stage-4: #1c5cab; --stage-5: #104281;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5; --gain: #3987e5; --loss: #e66767; --total: #898781;
+    --stage-1: #184f95; --stage-2: #256abf; --stage-3: #3987e5; --stage-4: #6da7ec; --stage-5: #9ec5f4;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+  --series-1: #3987e5; --gain: #3987e5; --loss: #e66767; --total: #898781;
+  --stage-1: #184f95; --stage-2: #256abf; --stage-3: #3987e5; --stage-4: #6da7ec; --stage-5: #9ec5f4;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1040px; margin: 0 auto; padding: 32px 20px 48px; }
+h1 { font-size: 24px; margin: 0 0 4px; font-weight: 600; }
+h2 { font-size: 16px; margin: 0 0 2px; font-weight: 600; }
+.sub { color: var(--ink-2); margin: 0 0 14px; }
+header { margin-bottom: 20px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 10px;
+  margin-bottom: 16px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 14px; }
+.tile-label { color: var(--ink-2); font-size: 12px; }
+.tile-value { font-size: 24px; font-weight: 600; margin-top: 2px; }
+.tile-note { color: var(--muted); font-size: 12px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 18px 20px; margin: 0 0 16px; }
+figure.card { margin: 0 0 16px; }
+.hbars { display: grid; gap: 6px; }
+.hrow { display: grid; grid-template-columns: minmax(150px, 34%) 1fr; align-items: center;
+  gap: 12px; padding: 3px 4px; border-radius: 6px; outline: none; }
+.hrow:hover, .hrow:focus-visible { background: var(--grid); }
+.hlabel { color: var(--ink-2); }
+.htrack { display: flex; align-items: center; gap: 8px; min-height: 20px; }
+.bar { height: 20px; border-radius: 0 4px 4px 0; flex: none; }
+.hvalue { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.series-1 { background: var(--series-1); fill: var(--series-1); }
+.stage-1 { background: var(--stage-1); } .stage-2 { background: var(--stage-2); }
+.stage-3 { background: var(--stage-3); } .stage-4 { background: var(--stage-4); }
+.stage-5 { background: var(--stage-5); }
+.gain { fill: var(--gain); background: var(--gain); }
+.loss { fill: var(--loss); background: var(--loss); }
+.total { fill: var(--total); background: var(--total); }
+.scroll { overflow-x: auto; }
+svg.cols { display: block; }
+svg .baseline { stroke: var(--axis); stroke-width: 1; }
+svg .cval { fill: var(--ink); font-size: 12px; text-anchor: middle; font-variant-numeric: tabular-nums; }
+svg .clab { fill: var(--ink-2); font-size: 12px; text-anchor: middle; }
+svg .hit { fill: transparent; outline: none; }
+svg .hit:hover, svg .hit:focus-visible { fill: var(--grid); fill-opacity: 0.35; }
+.legend { display: flex; gap: 16px; color: var(--ink-2); font-size: 12px; margin-bottom: 6px; }
+.key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px;
+  vertical-align: -1px; }
+details { margin-top: 12px; }
+summary { color: var(--ink-2); cursor: pointer; font-size: 13px; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+th { color: var(--ink-2); font-weight: 600; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.empty { color: var(--ink-2); margin: 6px 0 0; }
+.method ul { margin: 8px 0 0; padding-left: 18px; color: var(--ink-2); }
+.method li { margin: 4px 0; }
+footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+#tip { position: fixed; pointer-events: none; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12); display: grid; gap: 2px; z-index: 10; }
+#tip strong { font-size: 14px; }
+#tip span { color: var(--ink-2); }
+</style></head><body><main><header><h1>Kalshi structural arbitrage: research report</h1><p class="sub">run 20261009T163436Z-a9c3db · 2026-10-09 16:34 UTC · 60m long · 124 cycles, median 20s apart · taker fee 0.07, worst_case rounding · karb 0.1.0</p></header><section class="kpis"><div class="tile"><div class="tile-label">Event groups watched</div><div class="tile-value">218</div></div><div class="tile"><div class="tile-label">Order-book snapshots</div><div class="tile-value">19,107</div></div><div class="tile"><div class="tile-label">Solver-positive snapshots</div><div class="tile-value">464</div><div class="tile-note">before fee rounding</div></div><div class="tile"><div class="tile-label">Verified snapshots</div><div class="tile-value">124</div><div class="tile-note">after fees and rounding</div></div><div class="tile"><div class="tile-label">Distinct opportunities</div><div class="tile-value">1</div></div><div class="tile"><div class="tile-label">Paper trades</div><div class="tile-value">2</div></div><div class="tile"><div class="tile-label">Realized paper P&amp;L</div><div class="tile-value">-</div><div class="tile-note">nothing settled yet</div></div></section><figure class="card"><figcaption><h2>Where the edge goes</h2><p class="sub">Each stage is a strict subset of the one before. Snapshots are one event group&#x27;s books in one cycle.</p></figcaption><div class="hbars" role="img" aria-label="Funnel from snapshots to paper trades"><div class="hrow" tabindex="0" data-value="19,107" data-label="Order-book snapshots"><div class="hlabel">Order-book snapshots</div><div class="htrack"><div class="bar stage-1" style="width:82.00%"></div><span class="hvalue">19,107</span></div></div><div class="hrow" tabindex="0" data-value="464" data-label="Solver-positive before rounding"><div class="hlabel">Solver-positive before rounding</div><div class="htrack"><div class="bar stage-2" style="width:1.99%"></div><span class="hvalue">464</span></div></div><div class="hrow" tabindex="0" data-value="124" data-label="Verified after fees and rounding"><div class="hlabel">Verified after fees and rounding</div><div class="htrack"><div class="bar stage-3" style="width:0.60%"></div><span class="hvalue">124</span></div></div><div class="hrow" tabindex="0" data-value="1" data-label="Distinct opportunities"><div class="hlabel">Distinct opportunities</div><div class="htrack"><div class="bar stage-4" style="width:0.60%"></div><span class="hvalue">1</span></div></div><div class="hrow" tabindex="0" data-value="2" data-label="Paper trades"><div class="hlabel">Paper trades</div><div class="htrack"><div class="bar stage-5" style="width:0.60%"></div><span class="hvalue">2</span></div></div></div><details><summary>Table view</summary><table><thead><tr><th>Stage</th><th class=num>Count</th></tr></thead><tbody><tr><td>Order-book snapshots</td><td class=num>19,107</td></tr><tr><td>Solver-positive before rounding</td><td class=num>464</td></tr><tr><td>Verified after fees and rounding</td><td class=num>124</td></tr><tr><td>Distinct opportunities</td><td class=num>1</td></tr><tr><td>Paper trades</td><td class=num>2</td></tr></tbody></table></details></figure><figure class="card"><figcaption><h2>Fee sensitivity</h2><p class="sub">Verified snapshots when identical recorded books are replayed under each fee model.</p></figcaption><div class="hbars" role="img" aria-label="Verified snapshots under each fee scenario"><div class="hrow" tabindex="0" data-value="124" data-label="as recorded"><div class="hlabel">as recorded</div><div class="htrack"><div class="bar series-1" style="width:1.27%"></div><span class="hvalue">124</span></div></div><div class="hrow" tabindex="0" data-value="8,021" data-label="no fees, no rounding"><div class="hlabel">no fees, no rounding</div><div class="htrack"><div class="bar series-1" style="width:82.00%"></div><span class="hvalue">8,021</span></div></div><div class="hrow" tabindex="0" data-value="2,483" data-label="half the taker coefficient"><div class="hlabel">half the taker coefficient</div><div class="htrack"><div class="bar series-1" style="width:25.38%"></div><span class="hvalue">2,483</span></div></div><div class="hrow" tabindex="0" data-value="130" data-label="direct member ($0.0001 balances)"><div class="hlabel">direct member ($0.0001 balances)</div><div class="htrack"><div class="bar series-1" style="width:1.33%"></div><span class="hvalue">130</span></div></div><div class="hrow" tabindex="0" data-value="124" data-label="rebate accumulator"><div class="hlabel">rebate accumulator</div><div class="htrack"><div class="bar series-1" style="width:1.27%"></div><span class="hvalue">124</span></div></div></div><details><summary>Table view</summary><table><thead><tr><th>Scenario</th><th class=num>Solver-positive</th><th class=num>Verified</th><th class=num>Opportunities</th><th class=num>Sum of best guaranteed</th></tr></thead><tbody><tr><td>as recorded</td><td class=num>464</td><td class=num>124</td><td class=num>1</td><td class=num>$0.75</td></tr><tr><td>no fees, no rounding</td><td class=num>8,442</td><td class=num>8,021</td><td class=num>191</td><td class=num>$611.40</td></tr><tr><td>half the taker coefficient</td><td class=num>4,094</td><td class=num>2,483</td><td class=num>40</td><td class=num>$71.48</td></tr><tr><td>direct member ($0.0001 balances)</td><td class=num>464</td><td class=num>130</td><td class=num>4</td><td class=num>$0.92</td></tr><tr><td>rebate accumulator</td><td class=num>464</td><td class=num>124</td><td class=num>1</td><td class=num>$0.75</td></tr></tbody></table></details></figure><figure class="card"><figcaption><h2>How long opportunities lasted</h2><p class="sub">Observed lower bounds: an opportunity is seen only when its group is confirmed. 1 of 1 were still live when the run ended.</p></figcaption><div class="scroll"><svg class="cols" width="668" height="220" viewBox="0 0 668 220" role="img" aria-label="Histogram of opportunity lifetimes"><line class="baseline" x1="12.0" x2="656" y1="162.0" y2="162.0"/><text class="cval" x="58.0" y="155.0">0</text><text class="clab" x="58.0" y="210">one snapshot</text><rect class="hit" tabindex="0" x="12.0" y="0" width="92.0" height="194" data-value="0" data-label="one snapshot"/><text class="cval" x="150.0" y="155.0">0</text><text class="clab" x="150.0" y="210">up to 10 s</text><rect class="hit" tabindex="0" x="104.0" y="0" width="92.0" height="194" data-value="0" data-label="up to 10 s"/><text class="cval" x="242.0" y="155.0">0</text><text class="clab" x="242.0" y="210">10-30 s</text><rect class="hit" tabindex="0" x="196.0" y="0" width="92.0" height="194" data-value="0" data-label="10-30 s"/><text class="cval" x="334.0" y="155.0">0</text><text class="clab" x="334.0" y="210">30 s-1 min</text><rect class="hit" tabindex="0" x="288.0" y="0" width="92.0" height="194" data-value="0" data-label="30 s-1 min"/><text class="cval" x="426.0" y="155.0">0</text><text class="clab" x="426.0" y="210">1-5 min</text><rect class="hit" tabindex="0" x="380.0" y="0" width="92.0" height="194" data-value="0" data-label="1-5 min"/><text class="cval" x="518.0" y="155.0">0</text><text class="clab" x="518.0" y="210">5-15 min</text><rect class="hit" tabindex="0" x="472.0" y="0" width="92.0" height="194" data-value="0" data-label="5-15 min"/><path class="series-1" d="M598.0,162.0V30.0Q598.0,26.0 602.0,26.0H618.0Q622.0,26.0 622.0,30.0V162.0Z"/><text class="cval" x="610.0" y="19.0">1</text><text class="clab" x="610.0" y="210">over 15 min</text><rect class="hit" tabindex="0" x="564.0" y="0" width="92.0" height="194" data-value="1" data-label="over 15 min"/></svg></div><details><summary>Table view</summary><table><thead><tr><th>Group</th><th>Kind</th><th class=num>Sightings</th><th class=num>Lifetime</th><th class=num>Best guaranteed</th><th class=num>Still live at end</th></tr></thead><tbody><tr><td>KXGDPYEAR-36</td><td>UNDERROUND STRUCTURAL</td><td class=num>124</td><td class=num>50m</td><td class=num>$0.7500</td><td class=num>yes</td></tr></tbody></table></details></figure><section class="card"><h2>Paper trading: where the planned edge went</h2><p class="empty">No paper trade has settled yet: run karb settle later.</p></section><section class="card"><h2>Paper trades</h2><p class="sub">2 open, holding at least $1.50 guaranteed until settlement.</p><div class="scroll"><table><thead><tr><th>#</th><th>Decided (UTC)</th><th>Group</th><th>Kind</th><th class=num>Planned</th><th class=num>Execution</th><th class=num>Hedging</th><th class=num>Realized</th><th class=num>Filled</th><th class=num>Status</th></tr></thead><tbody><tr><td>a4094a/0001</td><td>10-09 16:44:14</td><td>KXGDPYEAR-36</td><td>UNDERROUND STRUCTURAL</td><td class=num>$0.75</td><td class=num>$0.00</td><td class=num>$0.00</td><td class=num>-</td><td class=num>100%</td><td class=num>open</td></tr><tr><td>8c79c7/0001</td><td>10-09 16:44:14</td><td>KXGDPYEAR-36</td><td>UNDERROUND STRUCTURAL</td><td class=num>$0.75</td><td class=num>$0.00</td><td class=num>$0.00</td><td class=num>-</td><td class=num>100%</td><td class=num>open</td></tr></tbody></table></div></section><section class="card"><h2>Screen hits</h2><p class="sub">Integer necessary conditions on listing quotes, counted each time listings refreshed. A hit only earns a book fetch.</p><table><thead><tr><th>Tier</th><th>Rule</th><th class=num>Hits</th><th class=num>Groups</th></tr></thead><tbody><tr><td>LOGICAL</td><td>bids over $1</td><td class=num>583</td><td class=num>71</td></tr><tr><td>LOGICAL</td><td>bid above containing ask</td><td class=num>218</td><td class=num>31</td></tr><tr><td>LOGICAL</td><td>exclusive bids over $1</td><td class=num>50</td><td class=num>17</td></tr><tr><td>STRUCTURAL</td><td>exclusive bids over $1</td><td class=num>50</td><td class=num>17</td></tr><tr><td>STRUCTURAL</td><td>covering asks under $1</td><td class=num>47</td><td class=num>12</td></tr></tbody></table></section>
+<section class="card method"><h2>Method and caveats</h2><ul>
+<li>Every opportunity is a basket whose exact, fee-rounded payout beats its cost in every outcome
+the event can settle to: a linear programme over outcome atoms proposes it and integer arithmetic
+verifies it (ADR-0003).</li>
+<li>Fees: taker coefficient 0.07 times the series multiplier, rounded up per fill and aligned
+against the trader; no rebates assumed unless stated (ADR-0002).</li>
+<li>Lifetimes are lower bounds: groups are observed only when confirmed, every few seconds, over a
+lossy public REST connection (ADR-0004).</li>
+<li>Paper trades decide on one book and fill on a book fetched a latency later; liquidity taken
+stays taken; partial fills are repaired with the same LP; settlement audits the contract reading
+(ADR-0008).</li>
+<li>Public data only, research only: nothing here can place an order.</li>
+</ul></section>
+<footer>Generated 2026-10-09 18:00 UTC by karb 0.1.0 from a local recording. Public market data only.</footer></main><div id="tip" role="tooltip" hidden></div><script>
+(() => {
+  const tip = document.getElementById('tip');
+  const show = (el, x, y) => {
+    const value = document.createElement('strong');
+    value.textContent = el.dataset.value;
+    const label = document.createElement('span');
+    label.textContent = el.dataset.label;
+    tip.replaceChildren(value, label);
+    tip.hidden = false;
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    tip.style.left = Math.min(x + 14, window.innerWidth - w - 8) + 'px';
+    tip.style.top = Math.max(8, y - h - 10) + 'px';
+  };
+  const hide = () => { tip.hidden = true; };
+  for (const el of document.querySelectorAll('[data-value]')) {
+    el.addEventListener('pointermove', (e) => show(el, e.clientX, e.clientY));
+    el.addEventListener('pointerleave', hide);
+    el.addEventListener('focus', () => {
+      const r = el.getBoundingClientRect();
+      show(el, r.left + r.width / 2, r.top);
+    });
+    el.addEventListener('blur', hide);
+  }
+})();
+</script></body></html>

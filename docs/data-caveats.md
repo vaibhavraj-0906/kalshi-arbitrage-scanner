@@ -131,6 +131,37 @@ Everything here was checked against the live API and documentation on 2026-09-13
   are served by `/historical/markets/{ticker}/candlesticks`, which `karb history` does not use
   yet.
 
+## Paper trading
+
+- **Paper fills are simulations against fetched books.** No order is ever sent.
+  - **Latency:** live latency is the configured delay (1 s by default) plus real fetch time.
+  - **Replayed latency:** the recording's confirmation cadence, usually several seconds, which
+    deliberately overstates it.
+  - **Queue priority:** a real order arriving first would beat others to the displayed size. A
+    real order arriving late would find size already gone that the snapshot still shows. The
+    simulator assumes neither, and only ever fills against what the later book displays.
+- **One paper trade per event group per run.** A paper trader does not move the market. Repeated
+  trades against a lasting violation would count the same displayed size many times.
+- **Settlement waits for `finalized`.**
+  - `determined` results can still be disputed or amended.
+  - Settlement uses `settlement_value_dollars` when present, so voided or partially settled
+    markets pay what the exchange paid.
+  - Markets archived past Kalshi's historical cutoff (2026-08-10 when checked) are looked up in
+    `/historical/markets/{ticker}`. That path is covered by a mock, not by a live archived
+    market.
+- **A model violation means karb's reading was wrong.** Treat it as a bug report against
+  classification (see ADR-0006), not as bad luck.
+
+## Operations
+
+- **DuckDB `executemany` is unusable for list columns.** On DuckDB 1.5.5 it took 44.6 s to write
+  188 order books (about a quarter of a second per row), and even scalar-only rows ran at about
+  10 ms each. Milestone 2 shipped with that write path; a full-universe recording could not keep
+  up. Since Milestone 3 every bulk write is one JSON document unpacked by `from_json`. The same
+  188 books take about 15 ms, and integers round-trip exactly.
+- **Memory.** A full-universe scan holds the classified universe (about 12,000 groups) and, when
+  recording, every event's structural JSON. Expect around 1 GB of resident memory.
+
 ## Capital and settlement
 
 - **Capital is gross cash outlay.**

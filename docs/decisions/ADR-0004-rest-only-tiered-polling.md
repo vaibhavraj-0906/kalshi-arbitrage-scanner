@@ -46,3 +46,24 @@ immediately.
   case. Events wider than 100 markets pay a measured skew.
 - **Adding WebSockets later is contained.** Credentials would replace Tier C polling with deltas
   without touching detection, which takes a snapshot and does not care how it was assembled.
+
+## Amendment (Milestone 3): background tiers and outage recovery
+
+The first hour-long research recording exposed two flaws in running the tiers in sequence:
+
+- **Starvation.** On the development network a full listing refresh took longer than its
+  90-second interval. It therefore ran before every cycle, and the 10-second confirmation tier
+  managed only five cycles in 14 minutes.
+- **Fragility.** A DNS failure during a re-discovery exhausted the client's retries, and the
+  exception ended the scan.
+
+Continuous scans now run discovery and listing refreshes as background tasks:
+
+- Confirmation keeps running against the previous universe, and each refresh is applied when it
+  completes.
+- A failed refresh is recorded as an outage and retried with exponential backoff (15 s doubling
+  to 5 min).
+- Discovered event data and fee schedules are merged rather than replaced. A cycle already in
+  flight can then still record a group whose event closed during the refresh.
+
+`tests/integration/test_scanner_resilience.py` reproduces the outage.

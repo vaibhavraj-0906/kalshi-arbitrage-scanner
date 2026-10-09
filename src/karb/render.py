@@ -124,14 +124,17 @@ def opportunities_table(
     return table
 
 
-def status_line(report: CycleReport, stats: ClientStats, tracker: OpportunityTracker) -> Text:
+def status_line(
+    report: CycleReport, stats: ClientStats, tracker: OpportunityTracker, outages: int = 0
+) -> Text:
     confirmed = sum(1 for sighting in tracker.live() if tracker.is_confirmed(sighting))
     issues = len(report.integrity) + len(report.fetch_errors)
     return Text(
         f"{report.finished_at:%H:%M:%S} UTC | {report.screened:,} events screened, "
         f"{len(report.hits)} screen hits | books confirmed for {len(report.detections)} events | "
         f"{confirmed} confirmed | requests {stats.requests:,} (retries {stats.retries:,}, "
-        f"resets {stats.resets:,}, 429s {stats.throttled}) | integrity issues {issues}",
+        f"resets {stats.resets:,}, 429s {stats.throttled}) | integrity issues {issues}"
+        + (f" | outages {outages}" if outages else ""),
         style="dim",
     )
 
@@ -228,7 +231,7 @@ def audit_view(
             # x = 0 is always feasible, so a negative optimum is solver noise around zero.
             "not solved"
             if solution is None
-            else f"${max(solution.profit, 0.0):,.6f} (before fee rounding)",
+            else f"${(solution.profit if solution.profit > 0 else 0.0):,.6f} (before fee rounding)",
         )
 
     lines = [

@@ -2,8 +2,13 @@
 
 Conventions follow tengine's market-data store. Money is exact integers -- prices in $0.0001,
 quantities in 0.01 contracts, cash in $0.000001 -- never ``DOUBLE``. Timestamps are integer
-nanoseconds since the epoch. The one ``DOUBLE`` column is the LP's pre-rounding objective, a
-diagnostic that is never money.
+nanoseconds since the epoch. The ``DOUBLE`` columns are diagnostics, never money: the LP's
+pre-rounding objective and a paper trade's fill ratio.
+
+Rows are written in bulk as one JSON document unpacked by DuckDB's ``from_json``. Parameter
+binding is the obvious alternative and is unusable here: on DuckDB 1.5, ``executemany`` took
+45 seconds to write 188 order books (list columns bind at about a quarter-second per row), where
+the JSON path takes 15 milliseconds and round-trips every integer exactly.
 
 DuckDB lets one process write a file at a time. Stop a recording ``karb scan`` before reading the
 same file with ``karb stats``, or read a copy.
@@ -15,7 +20,7 @@ import json
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -34,16 +39,23 @@ __all__ = [
     "SCHEMA_VERSION",
     "ObservationRow",
     "OpportunityRow",
+    "PaperOrderRow",
+    "PaperSessionRow",
+    "PaperTradeRow",
     "RecordStore",
     "RunInfo",
+    "SettlementRow",
     "StoreError",
     "new_id",
 ]
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
+"""v1: recordings and replays (Milestone 2). v2 adds paper trading and settlements."""
+
 LIVE_SOURCE: Final = "live"
 """The ``source`` of rows the scanner recorded itself. Saved replays use their replay id."""
 
+_PAPER_TABLES: Final = ("paper_sessions", "paper_trades", "paper_orders", "settlements")
 _TABLES: Final = (
     "runs",
     "cycles",
@@ -54,6 +66,7 @@ _TABLES: Final = (
     "solver_results",
     "opportunities",
     "replays",
+    *_PAPER_TABLES,
 )
 
 _SCHEMA: Final = """
@@ -160,7 +173,177 @@ CREATE TABLE IF NOT EXISTS replays (
     karb_version VARCHAR NOT NULL,
     config       VARCHAR NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS paper_sessions (
+    paper_id     VARCHAR PRIMARY KEY,
+    run_id       VARCHAR NOT NULL,
+    kind         VARCHAR NOT NULL,
+    created_ns   BIGINT  NOT NULL,
+    karb_version VARCHAR NOT NULL,
+    config       VARCHAR NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+    trade_id          VARCHAR PRIMARY KEY,
+    paper_id          VARCHAR NOT NULL,
+    run_id            VARCHAR NOT NULL,
+    cycle_no          INTEGER NOT NULL,
+    group_key         VARCHAR NOT NULL,
+    event_ticker      VARCHAR NOT NULL,
+    opportunity_id    VARCHAR NOT NULL,
+    kind              VARCHAR NOT NULL,
+    tier              VARCHAR NOT NULL,
+    decided_ns        BIGINT  NOT NULL,
+    entry_ns          BIGINT,
+    hedge_ns          BIGINT,
+    planned_cost      BIGINT  NOT NULL,
+    planned_pnl       BIGINT  NOT NULL,
+    entry_cost        BIGINT  NOT NULL,
+    worst_after_entry BIGINT  NOT NULL,
+    hedge_cost        BIGINT  NOT NULL,
+    worst_after_hedge BIGINT  NOT NULL,
+    best_after_hedge  BIGINT  NOT NULL,
+    planned_contracts BIGINT  NOT NULL,
+    filled_contracts  BIGINT  NOT NULL,
+    status            VARCHAR NOT NULL,
+    note              VARCHAR NOT NULL,
+    settled_ns        BIGINT,
+    payout            BIGINT,
+    realized_pnl      BIGINT,
+    model_violation   BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS paper_orders (
+    trade_id    VARCHAR NOT NULL,
+    phase       VARCHAR NOT NULL,
+    seq         INTEGER NOT NULL,
+    ticker      VARCHAR NOT NULL,
+    side        VARCHAR NOT NULL,
+    limit_price INTEGER NOT NULL,
+    ordered     BIGINT  NOT NULL,
+    filled      BIGINT  NOT NULL,
+    cash_out    BIGINT  NOT NULL,
+    fees        BIGINT  NOT NULL,
+    fills       VARCHAR NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settlements (
+    ticker     VARCHAR PRIMARY KEY,
+    status     VARCHAR NOT NULL,
+    result     VARCHAR NOT NULL,
+    yes_value  INTEGER,
+    settled_ns BIGINT,
+    fetched_ns BIGINT  NOT NULL
+);
 """
+
+_OBSERVATION_COLUMNS: Final = (
+    ("run_id", "VARCHAR"),
+    ("cycle_no", "INTEGER"),
+    ("group_key", "VARCHAR"),
+    ("event_ticker", "VARCHAR"),
+    ("series_ticker", "VARCHAR"),
+    ("payload_hash", "VARCHAR"),
+    ("series_fee_type", "VARCHAR"),
+    ("series_fee_multiplier", "VARCHAR"),
+    ("observed_ns", "BIGINT"),
+    ("skew_ns", "BIGINT"),
+    ("tradeable", "VARCHAR[]"),
+)
+_BOOK_COLUMNS: Final = (
+    ("run_id", "VARCHAR"),
+    ("cycle_no", "INTEGER"),
+    ("ticker", "VARCHAR"),
+    ("yes_prices", "INTEGER[]"),
+    ("yes_qtys", "BIGINT[]"),
+    ("no_prices", "INTEGER[]"),
+    ("no_qtys", "BIGINT[]"),
+)
+_SCREEN_HIT_COLUMNS: Final = (
+    ("run_id", "VARCHAR"),
+    ("cycle_no", "INTEGER"),
+    ("group_key", "VARCHAR"),
+    ("tier", "VARCHAR"),
+    ("rule", "VARCHAR"),
+    ("gross_edge", "INTEGER"),
+    ("detail", "VARCHAR"),
+)
+_SOLVER_COLUMNS: Final = (
+    ("source", "VARCHAR"),
+    ("run_id", "VARCHAR"),
+    ("cycle_no", "INTEGER"),
+    ("group_key", "VARCHAR"),
+    ("tier", "VARCHAR"),
+    ("status", "VARCHAR"),
+    ("profit", "DOUBLE"),
+)
+_OPPORTUNITY_COLUMNS: Final = (
+    ("source", "VARCHAR"),
+    ("run_id", "VARCHAR"),
+    ("cycle_no", "INTEGER"),
+    ("group_key", "VARCHAR"),
+    ("opportunity_id", "VARCHAR"),
+    ("kind", "VARCHAR"),
+    ("tier", "VARCHAR"),
+    ("observed_ns", "BIGINT"),
+    ("expires_ns", "BIGINT"),
+    ("cost", "BIGINT"),
+    ("fees", "BIGINT"),
+    ("guaranteed_pnl", "BIGINT"),
+    ("best_pnl", "BIGINT"),
+    ("contracts", "BIGINT"),
+    ("legs", "VARCHAR"),
+)
+_PAPER_TRADE_COLUMNS: Final = (
+    ("trade_id", "VARCHAR"),
+    ("paper_id", "VARCHAR"),
+    ("run_id", "VARCHAR"),
+    ("cycle_no", "INTEGER"),
+    ("group_key", "VARCHAR"),
+    ("event_ticker", "VARCHAR"),
+    ("opportunity_id", "VARCHAR"),
+    ("kind", "VARCHAR"),
+    ("tier", "VARCHAR"),
+    ("decided_ns", "BIGINT"),
+    ("entry_ns", "BIGINT"),
+    ("hedge_ns", "BIGINT"),
+    ("planned_cost", "BIGINT"),
+    ("planned_pnl", "BIGINT"),
+    ("entry_cost", "BIGINT"),
+    ("worst_after_entry", "BIGINT"),
+    ("hedge_cost", "BIGINT"),
+    ("worst_after_hedge", "BIGINT"),
+    ("best_after_hedge", "BIGINT"),
+    ("planned_contracts", "BIGINT"),
+    ("filled_contracts", "BIGINT"),
+    ("status", "VARCHAR"),
+    ("note", "VARCHAR"),
+    ("settled_ns", "BIGINT"),
+    ("payout", "BIGINT"),
+    ("realized_pnl", "BIGINT"),
+    ("model_violation", "BOOLEAN"),
+)
+_PAPER_ORDER_COLUMNS: Final = (
+    ("trade_id", "VARCHAR"),
+    ("phase", "VARCHAR"),
+    ("seq", "INTEGER"),
+    ("ticker", "VARCHAR"),
+    ("side", "VARCHAR"),
+    ("limit_price", "INTEGER"),
+    ("ordered", "BIGINT"),
+    ("filled", "BIGINT"),
+    ("cash_out", "BIGINT"),
+    ("fees", "BIGINT"),
+    ("fills", "VARCHAR"),
+)
+_SETTLEMENT_COLUMNS: Final = (
+    ("ticker", "VARCHAR"),
+    ("status", "VARCHAR"),
+    ("result", "VARCHAR"),
+    ("yes_value", "INTEGER"),
+    ("settled_ns", "BIGINT"),
+    ("fetched_ns", "BIGINT"),
+)
 
 
 class StoreError(RuntimeError):
@@ -219,16 +402,95 @@ class OpportunityRow:
     contracts: int
 
 
-class RecordStore:
-    """A DuckDB file of recorded runs."""
+@dataclass(frozen=True, slots=True)
+class PaperSessionRow:
+    paper_id: str
+    run_id: str
+    kind: str
+    """``live`` (traded while scanning) or ``replay`` (simulated over a recording)."""
+    created_ns: int
+    karb_version: str
+    config: dict[str, Any]
 
-    __slots__ = ("_connection", "path", "read_only")
+
+@dataclass(frozen=True, slots=True)
+class PaperTradeRow:
+    """One paper trade and its P&L attribution, in raw exact units (ADR-0008)."""
+
+    trade_id: str
+    paper_id: str
+    run_id: str
+    cycle_no: int
+    group_key: str
+    event_ticker: str
+    opportunity_id: str
+    kind: str
+    tier: str
+    decided_ns: int
+    entry_ns: int | None
+    hedge_ns: int | None
+    planned_cost: int
+    planned_pnl: int
+    entry_cost: int
+    worst_after_entry: int
+    hedge_cost: int
+    worst_after_hedge: int
+    best_after_hedge: int
+    planned_contracts: int
+    filled_contracts: int
+    status: str
+    """``open`` (holding to settlement), ``flat`` (nothing filled), ``missed`` (no arrival
+    book), or ``settled``."""
+    note: str
+    settled_ns: int | None = None
+    payout: int | None = None
+    realized_pnl: int | None = None
+    model_violation: bool | None = None
+
+    @property
+    def total_cost(self) -> int:
+        return self.entry_cost + self.hedge_cost
+
+
+@dataclass(frozen=True, slots=True)
+class PaperOrderRow:
+    trade_id: str
+    phase: str
+    """``plan`` (the basket as decided), ``entry`` or ``hedge``."""
+    seq: int
+    ticker: str
+    side: str
+    limit_price: int
+    ordered: int
+    filled: int
+    cash_out: int
+    fees: int
+    fills: str
+    """Exact fills as JSON: price, qty, trade fee, rounding fee and rebate per level."""
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementRow:
+    ticker: str
+    status: str
+    result: str
+    yes_value: int | None
+    """What one YES contract paid, in $0.0001. ``None`` until the market is final."""
+    settled_ns: int | None
+    fetched_ns: int
+
+
+class RecordStore:
+    """A DuckDB file of recorded runs and paper trades."""
+
+    __slots__ = ("_connection", "path", "read_only", "schema_version")
 
     def __init__(self, path: Path | str = ":memory:", *, read_only: bool = False) -> None:
         import duckdb
 
         self.path = str(path)
         self.read_only = read_only
+        self.schema_version = SCHEMA_VERSION
         in_memory = self.path == ":memory:"
         if read_only and (in_memory or not Path(self.path).exists()):
             raise StoreError(f"no recording at {self.path}")
@@ -264,10 +526,23 @@ class RecordStore:
             self._connection.execute(
                 "INSERT INTO meta VALUES ('schema_version', ?)", [str(SCHEMA_VERSION)]
             )
-        elif int(row[0]) != SCHEMA_VERSION:
+            return
+        version = int(row[0])
+        if version > SCHEMA_VERSION:
             raise StoreError(
-                f"{self.path} holds schema v{row[0]}; this karb reads v{SCHEMA_VERSION}"
+                f"{self.path} holds schema v{version}; this karb reads up to v{SCHEMA_VERSION}"
             )
+        if version < SCHEMA_VERSION and not self.read_only:
+            # Every version so far only adds tables, which _SCHEMA has just created.
+            self._connection.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'", [str(SCHEMA_VERSION)]
+            )
+            version = SCHEMA_VERSION
+        self.schema_version = version
+
+    @property
+    def has_paper_tables(self) -> bool:
+        return self.schema_version >= 2
 
     # ---- lifecycle ------------------------------------------------------------------------------
 
@@ -296,7 +571,33 @@ class RecordStore:
             raise
         self._connection.commit()
 
-    # ---- writing --------------------------------------------------------------------------------
+    def _insert_rows(
+        self,
+        table: str,
+        columns: Sequence[tuple[str, str]],
+        rows: Sequence[Sequence[object]],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Insert many rows in one statement: a JSON array of objects, unpacked by DuckDB.
+
+        ``columns`` are fixed per table in this module, so building the statement from them is
+        safe; values travel only inside the bound JSON document.
+        """
+        if not rows:
+            return
+        names = [name for name, _ in columns]
+        structure = json.dumps([{name: kind for name, kind in columns}])
+        document = json.dumps([dict(zip(names, row, strict=True)) for row in rows], allow_nan=False)
+        verb = "INSERT OR REPLACE" if replace else "INSERT"
+        fields = ", ".join(f"r.{name}" for name in names)
+        self._connection.execute(
+            f"{verb} INTO {table} ({', '.join(names)}) SELECT {fields} FROM "
+            f"(SELECT UNNEST(from_json(?::JSON, '{structure}')) AS r)",
+            [document],
+        )
+
+    # ---- writing: recordings --------------------------------------------------------------------
 
     def insert_run(
         self, run_id: str, started_ns: int, karb_version: str, config: Mapping[str, Any]
@@ -349,35 +650,14 @@ class RecordStore:
         )
 
     def insert_observations(self, rows: Sequence[ObservationRow]) -> None:
-        if not rows:
-            return
-        self._connection.executemany(
-            "INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                [
-                    row.run_id,
-                    row.cycle_no,
-                    row.group_key,
-                    row.event_ticker,
-                    row.series_ticker,
-                    row.payload_hash,
-                    row.series_fee_type,
-                    row.series_fee_multiplier,
-                    row.observed_ns,
-                    row.skew_ns,
-                    list(row.tradeable),
-                ]
-                for row in rows
-            ],
-        )
+        self._insert_rows("observations", _OBSERVATION_COLUMNS, [astuple(row) for row in rows])
 
     def insert_books(self, run_id: str, cycle_no: int, books: Mapping[str, OrderBook]) -> None:
-        if not books:
-            return
-        self._connection.executemany(
-            "INSERT INTO books VALUES (?, ?, ?, ?, ?, ?, ?)",
+        self._insert_rows(
+            "books",
+            _BOOK_COLUMNS,
             [
-                [run_id, cycle_no, ticker, *book_to_row(book)]
+                (run_id, cycle_no, ticker, *book_to_row(book))
                 for ticker, book in sorted(books.items())
             ],
         )
@@ -386,21 +666,17 @@ class RecordStore:
         self, run_id: str, cycle_no: int, rows: Sequence[tuple[str, str, str, int, str]]
     ) -> None:
         """Rows of (group_key, tier, rule, gross_edge, detail)."""
-        if rows:
-            self._connection.executemany(
-                "INSERT INTO screen_hits VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [[run_id, cycle_no, *row] for row in rows],
-            )
+        self._insert_rows(
+            "screen_hits", _SCREEN_HIT_COLUMNS, [(run_id, cycle_no, *row) for row in rows]
+        )
 
     def insert_solver_results(
         self, source: str, run_id: str, cycle_no: int, rows: Sequence[tuple[str, str, str, float]]
     ) -> None:
         """Rows of (group_key, tier, status, pre-rounding profit)."""
-        if rows:
-            self._connection.executemany(
-                "INSERT INTO solver_results VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [[source, run_id, cycle_no, *row] for row in rows],
-            )
+        self._insert_rows(
+            "solver_results", _SOLVER_COLUMNS, [(source, run_id, cycle_no, *row) for row in rows]
+        )
 
     def insert_opportunities(
         self,
@@ -410,12 +686,11 @@ class RecordStore:
         group_key: str,
         opportunities: Sequence[Opportunity],
     ) -> None:
-        if not opportunities:
-            return
-        self._connection.executemany(
-            "INSERT INTO opportunities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        self._insert_rows(
+            "opportunities",
+            _OPPORTUNITY_COLUMNS,
             [
-                [
+                (
                     source,
                     run_id,
                     cycle_no,
@@ -431,7 +706,7 @@ class RecordStore:
                     opportunity.basket.best_pnl.raw,
                     max((leg.order.qty.raw for leg in opportunity.basket.legs), default=0),
                     legs_json(opportunity),
-                ]
+                )
                 for opportunity in opportunities
             ],
         )
@@ -449,7 +724,51 @@ class RecordStore:
             [replay_id, run_id, created_ns, karb_version, json.dumps(config, sort_keys=True)],
         )
 
-    # ---- reading --------------------------------------------------------------------------------
+    # ---- writing: paper trading -----------------------------------------------------------------
+
+    def insert_paper_session(self, session: PaperSessionRow) -> None:
+        self._connection.execute(
+            "INSERT INTO paper_sessions VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                session.paper_id,
+                session.run_id,
+                session.kind,
+                session.created_ns,
+                session.karb_version,
+                json.dumps(session.config, sort_keys=True),
+            ],
+        )
+
+    def insert_paper_trade(self, trade: PaperTradeRow, orders: Sequence[PaperOrderRow]) -> None:
+        with self.transaction():
+            self._insert_rows("paper_trades", _PAPER_TRADE_COLUMNS, [astuple(trade)])
+            self._insert_rows("paper_orders", _PAPER_ORDER_COLUMNS, [astuple(o) for o in orders])
+
+    def settle_paper_trade(
+        self,
+        trade_id: str,
+        *,
+        settled_ns: int,
+        payout: int,
+        realized_pnl: int,
+        model_violation: bool,
+    ) -> None:
+        self._connection.execute(
+            """
+            UPDATE paper_trades
+            SET status = 'settled', settled_ns = ?, payout = ?, realized_pnl = ?,
+                model_violation = ?
+            WHERE trade_id = ?
+            """,
+            [settled_ns, payout, realized_pnl, model_violation, trade_id],
+        )
+
+    def upsert_settlements(self, rows: Sequence[SettlementRow]) -> None:
+        self._insert_rows(
+            "settlements", _SETTLEMENT_COLUMNS, [astuple(row) for row in rows], replace=True
+        )
+
+    # ---- reading: recordings --------------------------------------------------------------------
 
     def runs(self) -> list[RunInfo]:
         rows = self._connection.execute(
@@ -573,6 +892,27 @@ class RecordStore:
         ).fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
 
+    def solver_positive_observations(self, source: str, run_id: str, tolerance: float) -> int:
+        """Observations whose LP found profit above ``tolerance`` in at least one tier."""
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT cycle_no, group_key FROM solver_results
+                WHERE source = ? AND run_id = ? AND profit > ?
+            )
+            """,
+            [source, run_id, tolerance],
+        ).fetchone()
+        return 0 if row is None else int(row[0])
+
+    def cycle_times(self, run_id: str) -> list[tuple[int, int]]:
+        """(started_ns, finished_ns) of each recorded cycle, in order."""
+        rows = self._connection.execute(
+            "SELECT started_ns, finished_ns FROM cycles WHERE run_id = ? ORDER BY cycle_no",
+            [run_id],
+        ).fetchall()
+        return [(int(row[0]), int(row[1])) for row in rows]
+
     def verified_observations(self, source: str, run_id: str) -> int:
         row = self._connection.execute(
             """
@@ -608,6 +948,69 @@ class RecordStore:
     def table_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for table in _TABLES:
+            if table in _PAPER_TABLES and not self.has_paper_tables:
+                counts[table] = 0
+                continue
             row = self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
             counts[table] = 0 if row is None else int(row[0])
         return counts
+
+    # ---- reading: paper trading -----------------------------------------------------------------
+
+    def paper_sessions(self) -> list[PaperSessionRow]:
+        if not self.has_paper_tables:
+            return []
+        rows = self._connection.execute(
+            """
+            SELECT paper_id, run_id, kind, created_ns, karb_version, config
+            FROM paper_sessions ORDER BY created_ns, paper_id
+            """
+        ).fetchall()
+        return [
+            PaperSessionRow(row[0], row[1], row[2], row[3], row[4], json.loads(row[5]))
+            for row in rows
+        ]
+
+    def paper_trades(
+        self, *, paper_id: str | None = None, status: str | None = None
+    ) -> list[PaperTradeRow]:
+        if not self.has_paper_tables:
+            return []
+        names = ", ".join(name for name, _ in _PAPER_TRADE_COLUMNS)
+        clauses: list[str] = []
+        params: list[object] = []
+        if paper_id is not None:
+            clauses.append("paper_id = ?")
+            params.append(paper_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._connection.execute(
+            f"SELECT {names} FROM paper_trades {where} ORDER BY decided_ns, trade_id", params
+        ).fetchall()
+        return [PaperTradeRow(*row) for row in rows]
+
+    def paper_orders(self, trade_id: str) -> list[PaperOrderRow]:
+        if not self.has_paper_tables:
+            return []
+        names = ", ".join(name for name, _ in _PAPER_ORDER_COLUMNS)
+        rows = self._connection.execute(
+            f"SELECT {names} FROM paper_orders WHERE trade_id = ? ORDER BY phase, seq",
+            [trade_id],
+        ).fetchall()
+        return [PaperOrderRow(*row) for row in rows]
+
+    def settlements(self, tickers: Sequence[str]) -> dict[str, SettlementRow]:
+        if not self.has_paper_tables or not tickers:
+            return {}
+        names = ", ".join(name for name, _ in _SETTLEMENT_COLUMNS)
+        # A list bound as a parameter is slow to convert (see the module docstring); JSON is not.
+        rows = self._connection.execute(
+            f"""
+            SELECT {names} FROM settlements
+            WHERE ticker IN (SELECT UNNEST(from_json(?::JSON, '["VARCHAR"]')))
+            """,
+            [json.dumps(list(tickers))],
+        ).fetchall()
+        return {row[0]: SettlementRow(*row) for row in rows}

@@ -43,6 +43,9 @@ class DetectConfig:
     """Book depth per side considered by the LP."""
     max_contracts_per_leg: int | None = 5_000
     max_cost: Cash | None = None
+    min_apr: float | None = None
+    """Smallest annualised edge on gross capital worth reporting (0.05 is 5% a year). A basket
+    with no known expiry cannot clear a hurdle. ``None`` reports any edge, however slow."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +102,9 @@ def detect(snapshot: EventSnapshot, config: DetectConfig) -> Detection:
         basket = _best_verified(space, usable, solution, structure, config)
         if basket is not None and basket.guaranteed_pnl >= config.min_profit:
             opportunity = _opportunity(snapshot, tier, space, basket)
+            apr = opportunity.apr
+            if config.min_apr is not None and (apr is None or apr < config.min_apr):
+                continue
             return Detection((opportunity,), solutions, tuple(integrity))
     return Detection((), solutions, tuple(integrity))
 

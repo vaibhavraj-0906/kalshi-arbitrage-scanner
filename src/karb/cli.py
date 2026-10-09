@@ -1,9 +1,13 @@
 """The ``karb`` command line.
 
-Scanning: ``scan``, ``universe``, ``audit``, ``explain``.
+Scanning: ``scan``, ``universe``, ``events``, ``audit``, ``explain``.
 Research on recordings: ``runs``, ``replay``, ``stats``, ``sensitivity``, ``history``.
+Paper trading: ``scan --paper``, ``paper-replay``, ``settle``, ``pnl``.
+Reporting: ``report``.
+Offline tour: ``demo`` (see docs/guide.md).
 
-Public market data only. Nothing here can place an order; there is no code that could.
+Public market data only. Nothing here can place an order; there is no code that could. Paper
+trades are simulated against fetched books and never leave this machine.
 """
 
 from __future__ import annotations
@@ -18,25 +22,34 @@ from pathlib import Path
 from typing import Annotated, Final
 
 import typer
-from rich.console import Console, Group
+from rich.console import Console, Group, RenderableType
 from rich.live import Live
+from rich.table import Table
 from rich.text import Text
 
 from karb.arb.detect import DetectConfig, Detection, EventSnapshot, detect
 from karb.arb.screen import ScreenHit, screen_event
+from karb.core.clock import SystemClock
 from karb.core.fixed import Cash, FixedPointError
+from karb.dashboard import collect_report, render_report
+from karb.demo import run_demo
 from karb.exchange.client import ClientStats, KalshiClient, KalshiError
 from karb.exchange.endpoints import (
     fetch_event,
     fetch_exchange_status,
     fetch_one_series,
     fetch_orderbooks,
+    iter_events,
     pack_batches,
     trading_shards,
 )
 from karb.history import HistoryScreen, fetch_candles, minute_snapshots, screen_history
 from karb.market.book import OrderBook
 from karb.market.fees import CENT_BALANCE_UNIT, CENTICENT_BALANCE_UNIT, FeeConfig, RoundingMode
+from karb.paper.live import PaperTrader
+from karb.paper.replay import simulate_paper
+from karb.paper.settle import settle_open_trades
+from karb.paper.trade import PaperConfig
 from karb.render import (
     audit_view,
     explain_view,
@@ -45,7 +58,17 @@ from karb.render import (
     status_line,
     universe_view,
 )
-from karb.reports import history_view, replay_view, runs_table, sensitivity_table, stats_view
+from karb.reports import (
+    history_view,
+    paper_replay_view,
+    paper_trader_view,
+    pnl_view,
+    replay_view,
+    runs_table,
+    sensitivity_table,
+    settle_view,
+    stats_view,
+)
 from karb.scanner.service import CycleReport, ScanConfig, Scanner
 from karb.store.codec import detect_config_from_json
 from karb.store.database import LIVE_SOURCE, RecordStore, StoreError
@@ -82,6 +105,10 @@ TakerCoefficient = Annotated[
     str, typer.Option(help="Taker fee coefficient before series multipliers.")
 ]
 Levels = Annotated[int, typer.Option(help="Order book levels per side considered when sizing.")]
+MinApr = Annotated[
+    float | None,
+    typer.Option(help="Ignore baskets whose annualised edge is below this, e.g. 0.05 for 5%."),
+]
 AssertExhaustive = Annotated[
     list[str] | None,
     typer.Option(
@@ -97,6 +124,30 @@ Database = Annotated[Path, typer.Option("--db", help="Recording database (a Duck
 RunId = Annotated[
     str | None, typer.Argument(help="Run id from `karb runs`. Defaults to the latest run.")
 ]
+MaxTradeCost = Annotated[
+    str, typer.Option(help="Paper budget per basket in dollars, fees included.")
+]
+Capital = Annotated[
+    str, typer.Option(help="Paper capital that open positions may tie up, in dollars.")
+]
+NoHedge = Annotated[
+    bool, typer.Option("--no-hedge", help="Hold whatever filled instead of repairing it.")
+]
+Session = Annotated[
+    str | None, typer.Option("--session", help="Only this paper session (see `karb pnl`).")
+]
+
+
+def _paper_config(latency: float, max_trade_cost: str, capital: str, no_hedge: bool) -> PaperConfig:
+    try:
+        return PaperConfig(
+            latency=latency,
+            max_cost_per_trade=Cash.parse(max_trade_cost),
+            capital=Cash.parse(capital),
+            hedge=not no_hedge,
+        )
+    except (FixedPointError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _detect_config(
@@ -105,6 +156,7 @@ def _detect_config(
     direct_member: bool,
     taker_coefficient: str,
     levels: int,
+    min_apr: float | None = None,
 ) -> DetectConfig:
     try:
         profit = Cash.parse(min_profit)
@@ -116,7 +168,7 @@ def _detect_config(
         balance_unit=CENTICENT_BALANCE_UNIT if direct_member else CENT_BALANCE_UNIT,
         rounding_mode=rounding,
     )
-    return DetectConfig(fees=fees, min_profit=profit, max_levels=levels)
+    return DetectConfig(fees=fees, min_profit=profit, max_levels=levels, min_apr=min_apr)
 
 
 # ---- scanning -----------------------------------------------------------------------------------
@@ -146,17 +198,34 @@ def scan(
         Path | None,
         typer.Option("--record", help="Record every cycle to this DuckDB file for research."),
     ] = None,
+    duration: Annotated[
+        float | None, typer.Option(help="Stop after this many seconds (continuous mode).")
+    ] = None,
+    paper: Annotated[
+        bool, typer.Option("--paper", help="Paper-trade every new opportunity (needs --record).")
+    ] = False,
+    latency: Annotated[
+        float, typer.Option(help="Paper trading: seconds from seeing a book to orders arriving.")
+    ] = 1.0,
+    max_trade_cost: MaxTradeCost = "100",
+    capital: Capital = "10000",
+    no_hedge: NoHedge = False,
     min_profit: MinProfit = "0.01",
     rounding: Rounding = RoundingMode.WORST_CASE,
     direct_member: DirectMember = False,
     taker_coefficient: TakerCoefficient = "0.07",
     levels: Levels = 10,
+    min_apr: MinApr = None,
     assert_exhaustive: AssertExhaustive = None,
     rate: Rate = 8.0,
 ) -> None:
     """Scan for structural arbitrage: discover, screen, confirm against live order books."""
+    if paper and record is None:
+        raise typer.BadParameter("--paper needs --record: paper trades are kept in the recording")
     config = ScanConfig(
-        detect=_detect_config(min_profit, rounding, direct_member, taker_coefficient, levels),
+        detect=_detect_config(
+            min_profit, rounding, direct_member, taker_coefficient, levels, min_apr
+        ),
         series=tuple(series or ()),
         max_event_pages=max_pages,
         asserted_exhaustive=frozenset(assert_exhaustive or ()),
@@ -164,6 +233,7 @@ def scan(
         confirm_all=confirm_all,
         confirmations=confirmations,
     )
+    paper_config = _paper_config(latency, max_trade_cost, capital, no_hedge) if paper else None
     try:
         asyncio.run(
             _scan(
@@ -173,6 +243,8 @@ def scan(
                 show_candidates=show_candidates,
                 rate=rate,
                 record=record,
+                paper=paper_config,
+                duration=duration,
             )
         )
     except KeyboardInterrupt:
@@ -185,12 +257,19 @@ def scan(
         raise typer.Exit(1) from exc
 
 
-def _recording_hook(scanner: Scanner, recorder: Recorder | None) -> Callable[[CycleReport], None]:
-    def record(report: CycleReport) -> None:
-        if recorder is not None:
-            recorder.record_cycle(report, payloads=scanner.event_payloads, series=scanner.series)
+def _cycle_hook(
+    scanner: Scanner, recorder: Recorder | None, trader: PaperTrader | None
+) -> Callable[[CycleReport], None]:
+    def handle(report: CycleReport) -> None:
+        if recorder is None:
+            return
+        cycle_no = recorder.record_cycle(
+            report, payloads=scanner.event_payloads, series=scanner.series
+        )
+        if trader is not None:
+            trader.consider(report, cycle_no)
 
-    return record
+    return handle
 
 
 async def _scan(
@@ -201,29 +280,43 @@ async def _scan(
     show_candidates: bool,
     rate: float,
     record: Path | None,
+    paper: PaperConfig | None,
+    duration: float | None,
 ) -> None:
     store = None if record is None else RecordStore(record)
     recorder: Recorder | None = None
+    trader: PaperTrader | None = None
     try:
         async with KalshiClient(rate=rate) as client:
             if store is not None:
                 recorder = Recorder(store, client.clock)
-                recorder.start_run(config)
-                err_console.print(f"recording run {recorder.run_id} to {record}")
+                run_id = recorder.start_run(config)
+                err_console.print(f"recording run {run_id} to {record}")
+                if paper is not None:
+                    trader = PaperTrader(
+                        client, store, run_id=run_id, detect_config=config.detect, config=paper
+                    )
+                    err_console.print(f"paper trading as session {trader.paper_id}")
             if once:
                 with err_console.status("Starting", spinner="dots") as status:
                     scanner = Scanner(
                         client, config, progress=status.update, record_payloads=store is not None
                     )
-                    report = await scanner.run_once(on_cycle=_recording_hook(scanner, recorder))
+                    report = await scanner.run_once(on_cycle=_cycle_hook(scanner, recorder, trader))
+                    if trader is not None:
+                        status.update(f"Finishing {trader.pending} paper trade(s)")
+                        await trader.drain()
                 _emit_final(
                     scanner, report, client.stats, as_json=as_json, show_candidates=show_candidates
                 )
+                if trader is not None:
+                    err_console.print(paper_trader_view(trader))
                 return
 
             scanner = Scanner(client, config, record_payloads=store is not None)
-            record_cycle = _recording_hook(scanner, recorder)
+            record_cycle = _cycle_hook(scanner, recorder, trader)
             printed: set[str] = set()
+            last_view: list[RenderableType] = [Text("Starting")]
             with Live(
                 Text("Starting"), console=err_console if as_json else console, refresh_per_second=4
             ) as live:
@@ -234,7 +327,14 @@ async def _scan(
                     table = opportunities_table(
                         scanner.tracker, now=report.finished_at, show_unconfirmed=show_candidates
                     )
-                    live.update(Group(table, status_line(report, client.stats, scanner.tracker)))
+                    view = Group(
+                        table,
+                        status_line(
+                            report, client.stats, scanner.tracker, outages=len(scanner.outages)
+                        ),
+                    )
+                    last_view[0] = view
+                    live.update(view)
                     if not as_json:
                         return
                     for sighting in scanner.tracker.live():
@@ -244,7 +344,14 @@ async def _scan(
                             record_json = opportunity_record(opportunity, sighting, confirmed=True)
                             typer.echo(json.dumps(record_json))
 
-                await scanner.run_forever(on_cycle)
+                await scanner.run_forever(on_cycle, stop_after=duration)
+                if trader is not None and trader.pending:
+                    note = Text(f"Finishing {trader.pending} paper trade(s)", style="dim")
+                    live.update(Group(last_view[0], note))
+                    await trader.drain()
+                live.update(last_view[0])
+            if trader is not None:
+                err_console.print(paper_trader_view(trader))
     finally:
         if recorder is not None and recorder.run_id is not None:
             recorder.finish_run()
@@ -286,6 +393,49 @@ def _emit_final(
         )
     for issue in (report.fetch_errors + report.integrity)[:10]:
         err_console.print(f"[yellow]integrity:[/yellow] {issue}")
+
+
+@app.command()
+def events(
+    series: Annotated[
+        list[str], typer.Option("--series", "-s", help="Series to list, e.g. KXINX (repeatable).")
+    ],
+    limit: Annotated[int, typer.Option(help="Most events to show per series.")] = 20,
+    rate: Rate = 8.0,
+) -> None:
+    """List open events in a series, with how karb classifies each: tickers for audit/explain."""
+
+    async def run() -> None:
+        async with KalshiClient(rate=rate) as client:
+            table = Table(title="Open events", header_style="bold")
+            for name in ("Event", "Title", "Markets", "Structure"):
+                table.add_column(name)
+            for scope in series:
+                info = await fetch_one_series(client, scope)
+                shown = 0
+                async for event in iter_events(client, series_ticker=scope, max_pages=1):
+                    groups = split_by_participant(event)
+                    verdicts = []
+                    for group in groups:
+                        result = classify_event(group, info)
+                        if result.structure is not None:
+                            verdicts.append(result.structure.kind.value)
+                        elif result.exclusion is not None:
+                            verdicts.append(f"excluded: {result.exclusion.value}")
+                    summary = ", ".join(sorted(set(verdicts)))
+                    if len(groups) > 1:
+                        summary = f"{len(groups)} groups: {summary}"
+                    table.add_row(
+                        event.event_ticker, event.title[:48], str(len(event.markets)), summary
+                    )
+                    shown += 1
+                    if shown >= limit:
+                        break
+            if not table.rows:
+                table.caption = "No open events in those series."
+            console.print(table)
+
+    _run(run())
 
 
 @app.command()
@@ -390,11 +540,12 @@ def audit(
     direct_member: DirectMember = False,
     taker_coefficient: TakerCoefficient = "0.07",
     levels: Levels = 10,
+    min_apr: MinApr = None,
     assert_exhaustive: AssertExhaustive = None,
     rate: Rate = 8.0,
 ) -> None:
     """Show how one event is modelled: intervals, outcome spaces, fees, screens, LP, verdict."""
-    config = _detect_config(min_profit, rounding, direct_member, taker_coefficient, levels)
+    config = _detect_config(min_profit, rounding, direct_member, taker_coefficient, levels, min_apr)
 
     async def run() -> None:
         inspections = await _inspect(event_ticker, config, frozenset(assert_exhaustive or ()), rate)
@@ -411,11 +562,12 @@ def explain(
     direct_member: DirectMember = False,
     taker_coefficient: TakerCoefficient = "0.07",
     levels: Levels = 10,
+    min_apr: MinApr = None,
     assert_exhaustive: AssertExhaustive = None,
     rate: Rate = 8.0,
 ) -> None:
     """Price one event's best basket fill by fill, with its payoff in every outcome."""
-    config = _detect_config(min_profit, rounding, direct_member, taker_coefficient, levels)
+    config = _detect_config(min_profit, rounding, direct_member, taker_coefficient, levels, min_apr)
 
     async def run() -> None:
         inspections = await _inspect(event_ticker, config, frozenset(assert_exhaustive or ()), rate)
@@ -488,6 +640,7 @@ def _override(
     direct_member: bool | None,
     taker_coefficient: str | None,
     levels: int | None,
+    min_apr: float | None = None,
 ) -> DetectConfig:
     fees = recorded.fees
     config = recorded
@@ -504,6 +657,8 @@ def _override(
             config = replace(config, min_profit=Cash.parse(min_profit))
         if levels is not None:
             config = replace(config, max_levels=levels)
+        if min_apr is not None:
+            config = replace(config, min_apr=min_apr)
     except (FixedPointError, InvalidOperation, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     return config
@@ -537,6 +692,7 @@ def replay(
         str | None, typer.Option(help="Override the recorded taker fee coefficient.")
     ] = None,
     levels: Annotated[int | None, typer.Option(help="Override the recorded book depth.")] = None,
+    min_apr: MinApr = None,
 ) -> None:
     """Re-run detection over a recorded run: exactly as recorded, or under another fee model."""
     with _open_store(db, write=save) as store:
@@ -550,6 +706,7 @@ def replay(
             direct_member=direct_member,
             taker_coefficient=taker_coefficient,
             levels=levels,
+            min_apr=min_apr,
         )
         asserted = frozenset(run.config.get("asserted_exhaustive", []))
         with err_console.status(f"Replaying {run.observations:,} observations"):
@@ -622,6 +779,140 @@ def history(
             console.print(history_view(results, hours=hours))
 
     _run(run())
+
+
+# ---- paper trading ------------------------------------------------------------------------------
+
+
+@app.command("paper-replay")
+def paper_replay(
+    run_id: RunId = None,
+    db: Database = DEFAULT_DB,
+    latency_cycles: Annotated[
+        int, typer.Option(help="Recorded observations between decision and arrival.")
+    ] = 1,
+    max_trade_cost: MaxTradeCost = "100",
+    capital: Capital = "10000",
+    no_hedge: NoHedge = False,
+    min_profit: Annotated[
+        str | None, typer.Option(help="Override the recorded minimum profit, in dollars.")
+    ] = None,
+    rounding: Annotated[
+        RoundingMode | None, typer.Option(help="Override the recorded fee rounding model.")
+    ] = None,
+    direct_member: Annotated[
+        bool | None,
+        typer.Option("--direct-member/--no-direct-member", help="Override balance precision."),
+    ] = None,
+    taker_coefficient: Annotated[
+        str | None, typer.Option(help="Override the recorded taker fee coefficient.")
+    ] = None,
+    min_apr: MinApr = None,
+) -> None:
+    """Paper-trade a recorded run: decide on one snapshot, fill on a later one."""
+    paper_config = _paper_config(0.0, max_trade_cost, capital, no_hedge)
+    with _open_store(db, write=True) as store:
+        resolved = _resolve_run(store, run_id)
+        run = store.run(resolved)
+        config = _override(
+            detect_config_from_json(run.config["detect"]),
+            min_profit=min_profit,
+            rounding=rounding,
+            direct_member=direct_member,
+            taker_coefficient=taker_coefficient,
+            levels=None,
+            min_apr=min_apr,
+        )
+        asserted = frozenset(run.config.get("asserted_exhaustive", []))
+        with err_console.status(f"Paper trading {run.observations:,} recorded observations"):
+            result = simulate_paper(
+                store,
+                resolved,
+                config,
+                paper_config,
+                latency_cycles=latency_cycles,
+                asserted_exhaustive=asserted,
+            )
+        console.print(paper_replay_view(result))
+        console.print(
+            pnl_view(store.paper_trades(paper_id=result.paper_id), store.paper_sessions())
+        )
+
+
+@app.command()
+def settle(db: Database = DEFAULT_DB, session: Session = None, rate: Rate = 8.0) -> None:
+    """Settle open paper trades whose markets have finalized, and audit them against the model."""
+
+    async def run() -> None:
+        with _open_store(db, write=True) as store:
+            async with KalshiClient(rate=rate) as client:
+                summary = await settle_open_trades(store, client, paper_id=session)
+            console.print(settle_view(summary))
+
+    _run(run())
+
+
+@app.command()
+def pnl(db: Database = DEFAULT_DB, session: Session = None) -> None:
+    """Paper trades and their P&L attribution: planned, execution, hedging, settlement."""
+    with _open_store(db) as store:
+        console.print(pnl_view(store.paper_trades(paper_id=session), store.paper_sessions()))
+
+
+@app.command()
+def report(
+    run_id: RunId = None,
+    db: Database = DEFAULT_DB,
+    out: Annotated[
+        Path | None, typer.Option("--out", help="Where to write the HTML report.")
+    ] = None,
+    sensitivity: Annotated[
+        bool,
+        typer.Option("--sensitivity/--no-sensitivity", help="Replay under each fee scenario."),
+    ] = True,
+) -> None:
+    """Write a self-contained HTML research report for a recorded run."""
+    with _open_store(db) as store:
+        resolved = _resolve_run(store, run_id)
+        with err_console.status("Building the report"):
+            data = collect_report(
+                store, resolved, generated_at=SystemClock().now(), sensitivity=sensitivity
+            )
+    target = out or db.with_name(f"report-{resolved}.html")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(render_report(data), encoding="utf-8")
+    console.print(f"wrote {target}")
+
+
+@app.command()
+def demo(
+    db: Annotated[Path, typer.Option("--db", help="Where to write the demo recording.")] = Path(
+        "data/demo.duckdb"
+    ),
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite", help="Replace an existing demo recording.")
+    ] = False,
+) -> None:
+    """Build an offline demo recording: scan a simulated exchange, paper-trade, settle."""
+    if db.exists():
+        if not overwrite:
+            err_console.print(f"{db} exists; pass --overwrite to replace it")
+            raise typer.Exit(1)
+        with _open_store(db):
+            pass  # refuse to delete anything that is not a karb recording
+        db.unlink()
+        db.with_name(db.name + ".wal").unlink(missing_ok=True)
+    summary = asyncio.run(run_demo(db))
+    settlement = summary.settlement
+    lines = [
+        f"demo recording written to {db}",
+        f"  run {summary.run_id}: {summary.cycles} cycles over 3 simulated events",
+        f"  paper session {summary.paper_id}: {summary.trades} trades, "
+        f"{settlement.settled} settled, realized {summary.realized.dollars()}",
+        "next: karb runs | replay | stats | sensitivity | paper-replay | pnl | report "
+        f"--db {db}  (walkthrough: docs/guide.md)",
+    ]
+    console.print("\n".join(lines))
 
 
 def main() -> None:

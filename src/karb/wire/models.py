@@ -94,6 +94,9 @@ class MarketWire(WireModel):
     expected_expiration_time: OptionalDatetime = None
     latest_expiration_time: OptionalDatetime = None
     result: Text = ""
+    settlement_value_dollars: OptionalStr = None
+    """What one YES contract paid, once the market is determined."""
+    settlement_ts: OptionalDatetime = None
     exchange_index: int = 0
     fee_waiver_expiration_time: OptionalDatetime = None
     mve_collection_ticker: OptionalStr = None

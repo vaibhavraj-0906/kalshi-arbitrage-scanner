@@ -1,8 +1,11 @@
 # Architecture
 
 karb answers one question, continuously: *is there a basket of Kalshi contracts, buyable right
-now, that pays more than it costs in every way its event can settle?* Milestone 2 adds the
-research questions around it: how often, for how long, how large, and how much survives fees.
+now, that pays more than it costs in every way its event can settle?* The research layers around
+that question:
+- Milestone 2 asks how often, for how long, how large, and how much survives fees.
+- Milestone 3 asks how much a paper trader keeps once the books move.
+- Milestone 4 reports all of it ([research.md](research.md) has an hour of live results).
 
 ## Pipeline
 
@@ -39,7 +42,26 @@ CycleReport ─► Recorder ─► DuckDB ───────► event payload
 A recording keeps *inputs*: the exchange's event JSON (minus per-second fields), the books, and
 the per-observation facts detection used. Replays re-derive everything else with the current
 code, so a recording outlives the classification rules that were in force when it was made
-(ADR-0007).
+(ADR-0007). Detection results are cached on their exact inputs, so the unchanged books of quiet
+groups are not solved twice.
+
+## Paper trading and reporting
+
+```
+opportunity on B0 ─► plan_trade (budget, exact) ─► orders ─┐
+                                                           ▼
+             latency ─► B1 (re-fetched / next observation) ─► IOC fills ─► worst case W1
+                                                           │
+             decide repair on B1 (LP with base payoff) ────┘
+             latency ─► B2 ─► repair fills ─► worst case W2 ─► paper_trades / paper_orders
+                                                           │
+karb settle ─► finalized results ─► payout ─► realized ────┴─► attribution + model-violation audit
+karb report ─► one HTML file: KPIs, funnel, fee sensitivity, lifetimes, P&L waterfall, trades
+```
+
+The same lifecycle runs live (`scan --paper`, with sleeps and re-fetches) and over recordings
+(`paper-replay`, with later observations standing in for re-fetched books). See ADR-0008 and
+ADR-0009.
 
 ## Modules
 
@@ -56,8 +78,10 @@ code, so a recording outlives the classification rules that were in force when i
 | `karb.arb.opportunity` | Opportunities, stable ids, capital views, sighting lifecycle | Display ratios only |
 | `karb.exchange` | Async client: token bucket, jittered retries, pagination; typed endpoints | n/a |
 | `karb.scanner` | The three tiers and the loops that run them | n/a |
-| `karb.store` | Exact codecs, the DuckDB recording, the recorder, replay, episodes and fee sensitivity | LP diagnostics only |
+| `karb.store` | Exact codecs, the DuckDB recording (JSON bulk writes, schema upgrades), the recorder, cached replay, episodes and fee sensitivity | LP diagnostics only |
+| `karb.paper` | Budgeted plans, IOC execution with persistent liquidity, LP repair, settlement, exact attribution; live trader and recorded replay | LP proposals and display ratios only |
 | `karb.history` | Coarse historical screen from one-minute candles | Never |
+| `karb.dashboard` | The self-contained HTML research report | Chart geometry only |
 | `karb.render`, `karb.reports`, `karb.cli` | Rich tables, JSON records, the `karb` command | Display only |
 
 ## Invariants
@@ -91,6 +115,13 @@ code, so a recording outlives the classification rules that were in force when i
 7. **Recordings hold inputs, not conclusions.** Replays re-derive structure and detection from
    recorded payloads and books. A replay under the recorded configuration must reproduce the live
    run exactly, and `karb replay` checks that it does.
+8. **Paper fills never flatter the trader.**
+   - Every stage acts on a book one step old.
+   - Orders are IOC at limits set on the decision book.
+   - Liquidity taken stays taken.
+   - Missing or crossed books fill nothing.
+9. **Settlement audits the model.** Attribution telescopes exactly to the realized P&L. A
+   settlement below the guaranteed worst case is flagged as a model violation, never averaged in.
 
 ## What the tests prove
 
@@ -119,3 +150,22 @@ code, so a recording outlives the classification rules that were in force when i
   payloads hash identically regardless of quotes or market order.
 - `tests/unit/test_stats.py`, `tests/unit/test_history.py`: episode boundaries and censoring;
   candles carried through quiet minutes, and both of Kalshi's missing-quote encodings.
+- `tests/unit/test_paper_trade.py`: a half-filled overround priced by hand at every stage:
+  - the plan is +$7.48;
+  - after entry it is −$11.68;
+  - after unwinding through the LP it is −$8.42.
+
+  The file also covers budget scaling, liquidity that stays taken, and missed and flat trades.
+- `tests/property/test_paper_properties.py`:
+  - settling every market as any atom dictates pays exactly the atom model's payoff;
+  - unchanged books execute exactly as planned, and repair never lowers the worst case.
+- `tests/integration/test_paper.py`: end to end on the mock exchange.
+  - Live paper trading thins one leg on arrival.
+  - Settlement uses mocked final results, and waits while a held market is only `determined`.
+  - Replayed paper trading covers both a missed trade and a model violation.
+- `tests/unit/test_store.py`:
+  - bulk writes round-trip 2⁶² and 2⁵³+1 exactly, and doubles bit for bit;
+  - v1 recordings upgrade in place;
+  - newer or foreign files are refused.
+- `tests/integration/test_report_and_cli.py`: every report section renders, exchange labels are
+  escaped, and the research commands work through the real CLI.

@@ -143,3 +143,12 @@ def test_whole_contract_candidates() -> None:
     assert candidates[0] == {("A", Side.NO): Qty.contracts(10), ("B", Side.NO): Qty.contracts(7)}
     assert {("A", Side.NO): Qty.contracts(7), ("B", Side.NO): Qty.contracts(7)} in candidates
     assert {("A", Side.NO): Qty.contracts(1), ("B", Side.NO): Qty.contracts(1)} in candidates
+
+
+def test_an_annualised_hurdle_filters_slow_edges() -> None:
+    ev = three_way()
+    books = {t: book(t, yes=[("0.40", "50")], no=[("0.55", "50")]) for t in ev.tickers}
+    # $7.48 on $92.52 over the 30 days until expiry: about 98% a year.
+    (kept,) = detect(snapshot(ev, books), DetectConfig(min_apr=0.5)).opportunities
+    assert kept.apr is not None and 0.98 < kept.apr < 0.99
+    assert detect(snapshot(ev, books), DetectConfig(min_apr=2.0)).opportunities == ()

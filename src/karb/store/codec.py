@@ -164,6 +164,7 @@ def detect_config_to_json(config: DetectConfig) -> dict[str, Any]:
         "max_levels": config.max_levels,
         "max_contracts_per_leg": config.max_contracts_per_leg,
         "max_cost": None if config.max_cost is None else config.max_cost.raw,
+        "min_apr": config.min_apr,
     }
 
 
@@ -180,6 +181,8 @@ def detect_config_from_json(data: Mapping[str, Any]) -> DetectConfig:
         max_levels=int(data["max_levels"]),
         max_contracts_per_leg=None if max_contracts is None else int(max_contracts),
         max_cost=None if max_cost is None else Cash(int(max_cost)),
+        # Absent from recordings made before the hurdle existed.
+        min_apr=None if data.get("min_apr") is None else float(data["min_apr"]),
     )
 
 

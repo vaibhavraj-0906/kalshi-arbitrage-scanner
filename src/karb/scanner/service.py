@@ -18,6 +18,7 @@ project deliberately runs on public data only.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -149,6 +150,8 @@ class Scanner:
         self._targets: list[str] = []
         self._screened = 0
         self._untradeable = 0
+        self.outages: list[str] = []
+        """Background discoveries and listing refreshes that failed, newest last."""
 
     def _require_universe(self) -> Universe:
         if self.universe is None:
@@ -202,8 +205,10 @@ class Scanner:
                     result.exclusion, f"{group.event_ticker} {result.detail}".strip()
                 )
 
-        self.series = series
-        self.event_payloads = payloads
+        # Merged, not replaced: a cycle already in flight when this discovery lands may still
+        # record a group whose event has just closed, and the recorder needs its payload.
+        self.series.update(series)
+        self.event_payloads.update(payloads)
         self.universe = Universe(
             discovered_at=self.client.clock.now(),
             events_seen=len(events),
@@ -364,20 +369,86 @@ class Scanner:
                 on_cycle(report)
         return report
 
-    async def run_forever(self, on_cycle: Callable[[CycleReport], object]) -> None:
+    async def run_forever(
+        self, on_cycle: Callable[[CycleReport], object], *, stop_after: float | None = None
+    ) -> None:
+        """Scan until cancelled, or until ``stop_after`` seconds have passed.
+
+        Confirmation (Tier C) runs continuously. Discovery and listing refreshes (Tiers A and B)
+        take minutes over a lossy link, so they run in the background and are applied when they
+        finish; confirmation keeps going against the previous universe meanwhile. A failed
+        background refresh is recorded as an outage and retried with backoff -- a network blip
+        must not end a long recording.
+        """
         config, clock = self.config, self.client.clock
-        next_discovery = next_screen = clock.monotonic()
-        while True:
-            now = clock.monotonic()
-            rescreen = False
-            if self.universe is None or now >= next_discovery:
+        started = clock.monotonic()
+
+        def stopping() -> bool:
+            return stop_after is not None and clock.monotonic() - started >= stop_after
+
+        failures = 0
+        while self.universe is None:
+            if stopping():
+                return
+            try:
                 await self.discover()
-                next_discovery = now + config.discovery_interval
-                next_screen = now + config.screen_interval
-                rescreen = True
-            elif now >= next_screen:
-                await self.refresh_listings()
-                next_screen = now + config.screen_interval
-                rescreen = True
-            on_cycle(await self.cycle(rescreen=rescreen))
-            await self._sleep(config.confirm_interval)
+            except KalshiError as exc:
+                failures += 1
+                self._outage("discovery", exc)
+                await self._sleep(_backoff(failures))
+        failures = 0
+        next_discovery = clock.monotonic() + config.discovery_interval
+        next_screen = clock.monotonic() + config.screen_interval
+        background: asyncio.Task[object] | None = None
+        background_kind = ""
+        rescreen = True
+        try:
+            while not stopping():
+                now = clock.monotonic()
+                if background is not None and background.done():
+                    error = background.exception()
+                    if error is None:
+                        failures = 0
+                        rescreen = True
+                        done = clock.monotonic()
+                        next_screen = done + config.screen_interval
+                        if background_kind == "discovery":
+                            next_discovery = done + config.discovery_interval
+                    elif isinstance(error, KalshiError):
+                        failures += 1
+                        self._outage(background_kind, error)
+                        retry = clock.monotonic() + _backoff(failures)
+                        if background_kind == "discovery":
+                            next_discovery = retry
+                        else:
+                            next_screen = retry
+                    else:
+                        raise error
+                    background = None
+                if background is None:
+                    if now >= next_discovery:
+                        background, background_kind = (
+                            asyncio.create_task(self.discover()),
+                            "discovery",
+                        )
+                    elif now >= next_screen:
+                        background = asyncio.create_task(self.refresh_listings())
+                        background_kind = "listing refresh"
+                on_cycle(await self.cycle(rescreen=rescreen))
+                rescreen = False
+                await self._sleep(config.confirm_interval)
+        finally:
+            if background is not None and not background.done():
+                background.cancel()
+                with contextlib.suppress(asyncio.CancelledError, KalshiError):
+                    await background
+
+    def _outage(self, what: str, error: BaseException) -> None:
+        moment = self.client.clock.now()
+        self.outages.append(f"{moment:%H:%M:%S} {what} failed: {error}")
+        self.progress(f"{what} failed, retrying: {error}")
+
+
+def _backoff(failures: int) -> float:
+    """Seconds to wait after ``failures`` consecutive background failures: 15 s doubling to 5 min."""
+    return float(min(300, 15 * 2 ** (failures - 1)))
