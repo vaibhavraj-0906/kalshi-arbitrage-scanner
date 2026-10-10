@@ -1,6 +1,6 @@
 # ADR-0008: Paper execution, repair, settlement and attribution
 
-**Status:** Accepted · Milestone 3
+**Status:** Accepted · Milestone 3. The simulated fills are superseded by real orders on the demo exchange (ADR-0010). Planning, repair, settlement and attribution stand.
 
 ## Context
 

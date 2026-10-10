@@ -1,24 +1,28 @@
-"""One paper trade, from decision to attribution (docs/decisions/ADR-0008).
+"""One trade, from decision to attribution (docs/decisions/ADR-0008, ADR-0010).
 
-Timeline, with the same lag at every step a real taker would face:
+Timeline:
 
-    decision book B0  -- the snapshot detection saw: the basket is planned here
-    arrival book  B1  -- fetched one latency later: entry orders fill here
-    hedge book    B2  -- one latency after that: repair orders, decided on B1, fill here
+    decision book  -- the snapshot detection saw: the basket is planned and sized here
+    entry          -- immediate-or-cancel orders for every leg, sent at once; they fill against
+                      whatever the exchange holds when they arrive
+    repair         -- if the entry filled unevenly, books fetched after it decide the repair,
+                      which is sent the same way
 
-Each stage acts on information one book old. P&L is attributed exactly, in a chain that telescopes:
+P&L is attributed exactly, in a chain that telescopes:
 
     realized = planned + (after_entry - planned) + (after_hedge - after_entry) + (realized - after_hedge)
                          execution                 hedging                      settlement outcome
 
 ``planned``, ``after_entry`` and ``after_hedge`` are guaranteed (worst-atom) P&Ls under the
-opportunity's outcome model. The settlement outcome can never be negative if the model read the
-contracts correctly, so a negative one is flagged as a model violation.
+opportunity's outcome model, priced with the fees the exchange actually charged. The settlement
+outcome can never be negative if the model read the contracts correctly, so a negative one is
+flagged as a model violation.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -27,28 +31,22 @@ from karb.arb.detect import DetectConfig, EventSnapshot
 from karb.arb.opportunity import LegFill, Opportunity, VerifiedBasket
 from karb.arb.verify import verify_basket
 from karb.core.fixed import Cash, Qty
-from karb.market.book import OrderBook, Side
+from karb.market.book import Side
 from karb.market.fees import FeeConfig, FeeSchedule
-from karb.paper.execution import (
-    Execution,
-    Liquidity,
-    Order,
-    execute,
-    plan_orders,
-    position_legs,
-)
-from karb.paper.hedge import decide_hedge, worst_and_best
 from karb.store.codec import dumps_exact, to_ns
-from karb.store.database import PaperOrderRow, PaperTradeRow
+from karb.store.database import TradeOrderRow, TradeRow
+from karb.trading.hedge import worst_and_best
+from karb.trading.orders import Order, PlacedOrder, plan_orders, position_legs
 
 __all__ = [
     "Attribution",
-    "PaperConfig",
+    "TradeConfig",
     "TradeOutcome",
     "TradePlan",
-    "complete_trade",
-    "paper_config_to_json",
+    "assemble_outcome",
+    "netted_cash",
     "plan_trade",
+    "trade_config_to_json",
     "trade_rows",
 ]
 
@@ -58,29 +56,34 @@ DEFAULT_CAPITAL = Cash(10_000_000_000)
 
 
 @dataclass(frozen=True, slots=True)
-class PaperConfig:
-    latency: float = 1.0
-    """Seconds between seeing a book and orders arriving at the exchange (live trading)."""
+class TradeConfig:
     max_cost_per_trade: Cash = DEFAULT_MAX_COST_PER_TRADE
     """Budget per basket, fees included. Larger baskets are scaled down. Default $100."""
     capital: Cash = DEFAULT_CAPITAL
     """Cash that open positions may tie up in total. Default $10,000."""
     hedge: bool = True
     """Repair half-filled baskets; off means holding whatever filled."""
+    max_trades: int | None = None
+    """Stop trading after this many trades in a session."""
+    batch_size: int = 10
+    """Orders per batched request. Kalshi's Basic tier fits ten in its write bucket."""
 
     def __post_init__(self) -> None:
-        if self.latency < 0:
-            raise ValueError("latency cannot be negative")
         if self.max_cost_per_trade.raw <= 0 or self.capital.raw <= 0:
             raise ValueError("budgets must be positive")
+        if self.max_trades is not None and self.max_trades < 1:
+            raise ValueError("max_trades must be at least 1")
+        if not 1 <= self.batch_size <= 10:
+            raise ValueError("batch_size must be between 1 and 10")
 
 
-def paper_config_to_json(config: PaperConfig) -> dict[str, Any]:
+def trade_config_to_json(config: TradeConfig) -> dict[str, Any]:
     return {
-        "latency": config.latency,
         "max_cost_per_trade": config.max_cost_per_trade.raw,
         "capital": config.capital.raw,
         "hedge": config.hedge,
+        "max_trades": config.max_trades,
+        "batch_size": config.batch_size,
     }
 
 
@@ -111,10 +114,10 @@ def plan_trade(
     snapshot: EventSnapshot,
     group_key: str,
     detect_config: DetectConfig,
-    paper_config: PaperConfig,
+    config: TradeConfig,
 ) -> TradePlan | str:
     """The orders to send for ``opportunity``, or the reason there are none."""
-    budget = paper_config.max_cost_per_trade
+    budget = config.max_cost_per_trade
     fees = snapshot.structure.fees
     legs = opportunity.basket.legs
     cost = opportunity.cost
@@ -151,7 +154,7 @@ class Attribution:
 
     @property
     def execution(self) -> Cash:
-        """Latency, price moves, missing size and leg imbalance, all at entry."""
+        """Price moves, missing size and leg imbalance between decision and fill."""
         return self.after_entry - self.planned
 
     @property
@@ -169,18 +172,33 @@ class Attribution:
         return self.realized is not None and self.realized < self.after_hedge
 
 
+def netted_cash(legs: Sequence[LegFill]) -> Cash:
+    """Cash the exchange returns at once for YES and NO held in the same market.
+
+    Kalshi keeps one signed position per market, so buying the other side of a held market
+    closes pairs at $1 each immediately. The model keeps holding both sides until settlement,
+    where they pay the same $1, so only the timing differs.
+    """
+    held: dict[tuple[str, Side], int] = defaultdict(int)
+    for leg in legs:
+        held[(leg.ticker, leg.side)] += leg.order.qty.raw
+    pairs = sum(min(held[(t, Side.YES)], held[(t, Side.NO)]) for t in {t for t, _ in held})
+    return Qty(pairs).payout()
+
+
 @dataclass(frozen=True, slots=True)
 class TradeOutcome:
     plan: TradePlan
     decided_at: datetime
     entry_at: datetime | None
     hedge_at: datetime | None
-    entry: tuple[Execution, ...]
-    hedge: tuple[Execution, ...]
+    entry: tuple[PlacedOrder, ...]
+    hedge: tuple[PlacedOrder, ...]
     attribution: Attribution
     best_after_hedge: Cash
     status: str
     note: str
+    balance_change: Cash | None = None
 
     @property
     def position(self) -> tuple[LegFill, ...]:
@@ -188,11 +206,15 @@ class TradeOutcome:
 
     @property
     def entry_cost(self) -> Cash:
-        return Cash.total(e.cash_out for e in self.entry)
+        return Cash.total(placed.cash_out for placed in self.entry)
 
     @property
     def hedge_cost(self) -> Cash:
-        return Cash.total(e.cash_out for e in self.hedge)
+        return Cash.total(placed.cash_out for placed in self.hedge)
+
+    @property
+    def netted_cash(self) -> Cash:
+        return netted_cash(self.position)
 
     @property
     def planned_contracts(self) -> Qty:
@@ -204,89 +226,58 @@ class TradeOutcome:
     @property
     def filled_contracts(self) -> Qty:
         total = Qty.ZERO
-        for execution in self.entry:
-            total = total + execution.filled
+        for placed in self.entry:
+            total = total + placed.filled
         return total
 
+    @property
+    def orders(self) -> tuple[PlacedOrder, ...]:
+        return (*self.entry, *self.hedge)
 
-def complete_trade(
+
+def assemble_outcome(
     plan: TradePlan,
     *,
     decided_at: datetime,
-    entry_books: Mapping[str, OrderBook] | None,
+    entry: Sequence[PlacedOrder],
     entry_at: datetime | None,
-    hedge_books: Mapping[str, OrderBook] | None,
+    hedge: Sequence[PlacedOrder],
     hedge_at: datetime | None,
-    tradeable: frozenset[str],
-    fee_config: FeeConfig,
-    max_levels: int,
-    hedge: bool,
-    note: str = "",
+    notes: Sequence[str] = (),
+    balance_change: Cash | None = None,
 ) -> TradeOutcome:
-    """Execute ``plan`` on the arrival book, repair it on the next, and attribute the result."""
+    """Attribute what the exchange did with ``plan``'s orders."""
     space = plan.opportunity.space
-    planned = plan.planned_pnl
-    if entry_books is None:
-        return TradeOutcome(
-            plan,
-            decided_at,
-            None,
-            None,
-            (),
-            (),
-            Attribution(planned, Cash.ZERO, Cash.ZERO),
-            Cash.ZERO,
-            "missed",
-            note or "no book after the latency",
-        )
-
-    liquidity = Liquidity()
-    entry = execute(plan.orders, entry_books, liquidity, plan.fees, fee_config)
-    entry_legs = position_legs(entry)
-    after_entry, _ = worst_and_best(space, entry_legs)
-
-    notes = [note] if note else []
-    hedge_executions: tuple[Execution, ...] = ()
-    if hedge and entry_legs:
-        orders = decide_hedge(
-            space,
-            entry_books,
-            liquidity,
-            entry_legs,
-            tradeable,
-            plan.fees,
-            fee_config,
-            max_levels=max_levels,
-        )
-        if orders and hedge_books is None:
-            notes.append("hedge decided but no later book arrived: left unhedged")
-        elif orders and hedge_books is not None:
-            hedge_executions = execute(orders, hedge_books, liquidity, plan.fees, fee_config)
-    position = position_legs(entry, hedge_executions)
-    after_hedge, best = worst_and_best(space, position)
-
-    filled = sum(e.filled.raw for e in entry)
+    after_entry, _ = worst_and_best(space, position_legs(entry))
+    after_hedge, best = worst_and_best(space, position_legs(entry, hedge))
+    filled = sum(placed.filled.raw for placed in entry)
     ordered = sum(order.qty.raw for order in plan.orders)
+    remarks = list(notes)
     if filled < ordered:
-        notes.append(f"entry filled {filled / ordered:.0%}")
-    if hedge_executions:
-        notes.append(f"hedged with {len(hedge_executions)} order(s)")
+        remarks.append(f"entry filled {filled / ordered:.0%}")
+    if hedge:
+        remarks.append(f"repaired with {len(hedge)} order(s)")
+    errors = [p.error for p in (*entry, *hedge) if p.error]
+    if errors:
+        remarks.append(f"{len(errors)} order error(s): {errors[0]}")
+    held = position_legs(entry, hedge)
     return TradeOutcome(
         plan,
         decided_at,
         entry_at,
-        hedge_at if hedge_executions else None,
-        entry,
-        hedge_executions,
-        Attribution(planned, after_entry, after_hedge),
+        hedge_at if hedge else None,
+        tuple(entry),
+        tuple(hedge),
+        Attribution(plan.planned_pnl, after_entry, after_hedge),
         best,
-        "open" if position else "flat",
-        "; ".join(notes),
+        "open" if held else "flat",
+        "; ".join(remarks),
+        balance_change,
     )
 
 
-def _fills_json(fill: LegFill | None) -> str:
-    if fill is None:
+def _fills_json(leg: LegFill | None) -> str:
+    if leg is None:
         return "[]"
     return dumps_exact(
         [
@@ -297,21 +288,27 @@ def _fills_json(fill: LegFill | None) -> str:
                 "rounding_fee": f.rounding_fee.raw,
                 "rebate": f.rebate.raw,
             }
-            for f in fill.order.fills
+            for f in leg.order.fills
         ]
     )
 
 
 def trade_rows(
-    outcome: TradeOutcome, *, trade_id: str, paper_id: str, run_id: str, cycle_no: int
-) -> tuple[PaperTradeRow, list[PaperOrderRow]]:
+    outcome: TradeOutcome,
+    *,
+    trade_id: str,
+    session_id: str,
+    run_id: str,
+    cycle_no: int,
+    fee_config: FeeConfig,
+) -> tuple[TradeRow, list[TradeOrderRow]]:
     plan = outcome.plan
     opportunity = plan.opportunity
     attribution = outcome.attribution
-    flat = outcome.status in ("flat", "missed")
-    trade = PaperTradeRow(
+    flat = outcome.status == "flat"
+    trade = TradeRow(
         trade_id=trade_id,
-        paper_id=paper_id,
+        session_id=session_id,
         run_id=run_id,
         cycle_no=cycle_no,
         group_key=plan.group_key,
@@ -337,11 +334,13 @@ def trade_rows(
         payout=0 if flat else None,
         realized_pnl=0 if flat else None,
         model_violation=False if flat else None,
+        netted_cash=outcome.netted_cash.raw,
+        balance_change=None if outcome.balance_change is None else outcome.balance_change.raw,
     )
-    orders: list[PaperOrderRow] = []
+    orders: list[TradeOrderRow] = []
     for seq, (order, leg) in enumerate(zip(plan.orders, plan.basket.legs, strict=True)):
         orders.append(
-            PaperOrderRow(
+            TradeOrderRow(
                 trade_id,
                 "plan",
                 seq,
@@ -355,11 +354,11 @@ def trade_rows(
                 _fills_json(leg),
             )
         )
-    for phase, executions in (("entry", outcome.entry), ("hedge", outcome.hedge)):
-        for seq, execution in enumerate(executions):
-            order = execution.order
+    for phase, placed_orders in (("entry", outcome.entry), ("hedge", outcome.hedge)):
+        for seq, placed in enumerate(placed_orders):
+            order = placed.order
             orders.append(
-                PaperOrderRow(
+                TradeOrderRow(
                     trade_id,
                     phase,
                     seq,
@@ -367,10 +366,15 @@ def trade_rows(
                     order.side.value,
                     order.limit.raw,
                     order.qty.raw,
-                    execution.filled.raw,
-                    execution.cash_out.raw,
-                    execution.fees.raw,
-                    _fills_json(execution.fill),
+                    placed.filled.raw,
+                    placed.cash_out.raw,
+                    placed.fees.raw,
+                    _fills_json(placed.leg_fill()),
+                    client_order_id=placed.client_order_id,
+                    order_id=placed.order_id,
+                    model_fees=placed.model_fees(plan.fees, fee_config).raw,
+                    error=placed.error or None,
+                    response=placed.response_json() or None,
                 )
             )
     return trade, orders

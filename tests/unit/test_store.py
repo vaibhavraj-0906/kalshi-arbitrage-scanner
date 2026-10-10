@@ -11,8 +11,8 @@ from karb.core.fixed import Price, Qty
 from karb.market.book import Level, OrderBook
 from karb.store.database import (
     SCHEMA_VERSION,
-    PaperSessionRow,
     RecordStore,
+    SessionRow,
     SettlementRow,
     StoreError,
 )
@@ -48,20 +48,84 @@ def test_a_version_1_recording_is_upgraded_in_place(tmp_path: Path) -> None:
     with RecordStore(path) as store:
         store.insert_run("r1", 1, "0.1.0", {"detect": {}})
     connection = duckdb.connect(str(path))
-    for table in ("paper_sessions", "paper_trades", "paper_orders", "settlements"):
+    for table in ("trade_sessions", "trades", "trade_orders", "settlements"):
         connection.execute(f"DROP TABLE {table}")
     connection.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
     connection.close()
 
     with RecordStore(path, read_only=True) as old:
         assert old.schema_version == 1
-        assert old.paper_trades() == [] and old.paper_sessions() == []
+        assert old.trades() == [] and old.sessions() == []
         assert [run.run_id for run in old.runs()] == ["r1"]
 
     with RecordStore(path) as upgraded:
         assert upgraded.schema_version == SCHEMA_VERSION
-        upgraded.insert_paper_session(PaperSessionRow("p1", "r1", "replay", 2, "0.1.0", {}))
-        assert [s.paper_id for s in upgraded.paper_sessions()] == ["p1"]
+        upgraded.insert_session(SessionRow("s1", "r1", "demo", 2, "0.1.0", {}))
+        assert [s.session_id for s in upgraded.sessions()] == ["s1"]
+
+
+_V2_PAPER_TABLES = """
+CREATE TABLE paper_sessions (
+    paper_id VARCHAR PRIMARY KEY, run_id VARCHAR NOT NULL, kind VARCHAR NOT NULL,
+    created_ns BIGINT NOT NULL, karb_version VARCHAR NOT NULL, config VARCHAR NOT NULL
+);
+CREATE TABLE paper_trades (
+    trade_id VARCHAR PRIMARY KEY, paper_id VARCHAR NOT NULL, run_id VARCHAR NOT NULL,
+    cycle_no INTEGER NOT NULL, group_key VARCHAR NOT NULL, event_ticker VARCHAR NOT NULL,
+    opportunity_id VARCHAR NOT NULL, kind VARCHAR NOT NULL, tier VARCHAR NOT NULL,
+    decided_ns BIGINT NOT NULL, entry_ns BIGINT, hedge_ns BIGINT, planned_cost BIGINT NOT NULL,
+    planned_pnl BIGINT NOT NULL, entry_cost BIGINT NOT NULL, worst_after_entry BIGINT NOT NULL,
+    hedge_cost BIGINT NOT NULL, worst_after_hedge BIGINT NOT NULL,
+    best_after_hedge BIGINT NOT NULL, planned_contracts BIGINT NOT NULL,
+    filled_contracts BIGINT NOT NULL, status VARCHAR NOT NULL, note VARCHAR NOT NULL,
+    settled_ns BIGINT, payout BIGINT, realized_pnl BIGINT, model_violation BOOLEAN
+);
+CREATE TABLE paper_orders (
+    trade_id VARCHAR NOT NULL, phase VARCHAR NOT NULL, seq INTEGER NOT NULL,
+    ticker VARCHAR NOT NULL, side VARCHAR NOT NULL, limit_price INTEGER NOT NULL,
+    ordered BIGINT NOT NULL, filled BIGINT NOT NULL, cash_out BIGINT NOT NULL,
+    fees BIGINT NOT NULL, fills VARCHAR NOT NULL
+);
+INSERT INTO paper_sessions VALUES ('p1', 'r1', 'live', 1, '0.1.0', '{"paper": {"hedge": true}}');
+INSERT INTO paper_trades VALUES ('p1-0001', 'p1', 'r1', 1, 'G', 'EV', 'opp', 'OVERROUND',
+    'LOGICAL', 10, 11, NULL, 92520000, 7480000, 92520000, 7480000, 0, 7480000, 57480000,
+    15000, 15000, 'open', '', NULL, NULL, NULL, NULL);
+INSERT INTO paper_orders VALUES ('p1-0001', 'entry', 0, 'A', 'no', 6000, 5000, 5000,
+    30840000, 840000, '[]');
+"""
+
+
+def write_v2(path: Path) -> None:
+    """A recording as karb 0.1 left it: paper tables, schema v2."""
+    with RecordStore(path) as store:
+        store.insert_run("r1", 1, "0.1.0", {"detect": {}})
+    connection = duckdb.connect(str(path))
+    for table in ("trade_sessions", "trades", "trade_orders"):
+        connection.execute(f"DROP TABLE {table}")
+    connection.execute(_V2_PAPER_TABLES)
+    connection.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+    connection.close()
+
+
+def test_a_version_2_recording_reads_as_is_and_migrates_on_write(tmp_path: Path) -> None:
+    path = tmp_path / "v2.duckdb"
+    write_v2(path)
+
+    with RecordStore(path, read_only=True) as old:  # read-only: nothing on disk changes
+        assert old.schema_version == 2
+        (session,) = old.sessions()
+        assert (session.session_id, session.kind) == ("p1", "live")
+        (trade,) = old.trades()
+        assert (trade.session_id, trade.planned_pnl, trade.netted_cash) == ("p1", 7_480_000, None)
+        (order,) = old.trade_orders("p1-0001")
+        assert (order.ticker, order.fees, order.client_order_id) == ("A", 840_000, None)
+
+    with RecordStore(path) as upgraded:
+        assert upgraded.schema_version == SCHEMA_VERSION == 3
+        assert [t.trade_id for t in upgraded.trades(session_id="p1")] == ["p1-0001"]
+        assert upgraded.table_counts()["trade_orders"] == 1
+    tables = {row[0] for row in duckdb.connect(str(path)).execute("SHOW TABLES").fetchall()}
+    assert "paper_trades" not in tables and "trades" in tables
 
 
 def test_newer_schemas_and_strangers_are_refused(tmp_path: Path) -> None:

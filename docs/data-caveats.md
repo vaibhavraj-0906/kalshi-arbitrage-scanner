@@ -131,17 +131,28 @@ Everything here was checked against the live API and documentation on 2026-09-13
   are served by `/historical/markets/{ticker}/candlesticks`, which `karb history` does not use
   yet.
 
-## Paper trading
+## Trading on the demo exchange
 
-- **Paper fills are simulations against fetched books.** No order is ever sent.
-  - **Latency:** live latency is the configured delay (1 s by default) plus real fetch time.
-  - **Replayed latency:** the recording's confirmation cadence, usually several seconds, which
-    deliberately overstates it.
-  - **Queue priority:** a real order arriving first would beat others to the displayed size. A
-    real order arriving late would find size already gone that the snapshot still shows. The
-    simulator assumes neither, and only ever fills against what the later book displays.
-- **One paper trade per event group per run.** A paper trader does not move the market. Repeated
-  trades against a lasting violation would count the same displayed size many times.
+- **The demo exchange is not a market.** Its books are thin and quoted by test traders, so a scan
+  of it verifies many "arbitrage" baskets, some with absurd edges. Trading them proves the
+  machinery, not an edge, and its P&L is mock money. The real market's answer is in research.md.
+- **Batches are not atomic.** Kalshi documents per-order results for a batch but not
+  all-or-nothing behaviour. karb therefore treats each leg separately, and repairs whatever the
+  batch left uneven.
+- **Fees are measured, not assumed.** Each fill's `fee_cost` is recorded beside karb's model fee
+  for the same fill. The documented per-fill rounding to whole cents is added, and the balance
+  change is checked against both. If the exchange takes more than the model allowed, trading halts.
+- **Netting.** Kalshi holds one signed position per market, so buying the other side of a held
+  market closes pairs and returns $1 each at once. karb records that cash per trade. Settlement
+  checks compare the exchange's settlement revenue plus that cash with the model's payout.
+- **The account must be quiet.** The audit assumes the balance moves only because of the trade in
+  flight. Trading the same demo account from elsewhere at the same time will show up as an audit
+  failure and halt trading. That is deliberate.
+- **Positions held elsewhere are left alone.** karb skips a basket if the account already holds
+  any of its markets.
+- **One trade per event group per run, one at a time.** Opportunities found while a trade is in
+  flight wait their turn, so by the time they go out the book may have moved. The IOC limits cap
+  the price, and the repair handles size.
 - **Settlement waits for `finalized`.**
   - `determined` results can still be disputed or amended.
   - Settlement uses `settlement_value_dollars` when present, so voided or partially settled
@@ -151,6 +162,9 @@ Everything here was checked against the live API and documentation on 2026-09-13
     market.
 - **A model violation means karb's reading was wrong.** Treat it as a bug report against
   classification (see ADR-0006), not as bad luck.
+- **Recordings from before Milestone 5 hold paper trades.** Those were simulated against fetched
+  books and never reached an exchange. They migrate unchanged and are labelled as paper in
+  `karb pnl`.
 
 ## Operations
 
@@ -175,7 +189,8 @@ Everything here was checked against the live API and documentation on 2026-09-13
   one event shares one rulebook, which is the main reason it is safer than cross-venue
   arbitrage, but it is not immune.
 
-## Eligibility
+## Eligibility and real money
 
-Trading on Kalshi requires US KYC. karb is research-only by design: it reads public data and
-contains no code capable of authenticating or placing an order.
+Trading real money on Kalshi requires an eligible account (US KYC). karb does not do it: it
+signs requests only for the demo exchange, refuses every production host, and has no
+configuration that changes that (ADR-0010). A demo account and its API key are free.

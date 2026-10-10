@@ -2,12 +2,13 @@
 
 Scanning: ``scan``, ``universe``, ``events``, ``audit``, ``explain``.
 Research on recordings: ``runs``, ``replay``, ``stats``, ``sensitivity``, ``history``.
-Paper trading: ``scan --paper``, ``paper-replay``, ``settle``, ``pnl``.
+Trading on Kalshi's demo exchange: ``account``, ``order``, ``trade``, ``settle``, ``pnl``.
 Reporting: ``report``.
 Offline tour: ``demo`` (see docs/guide.md).
 
-Public market data only. Nothing here can place an order; there is no code that could. Paper
-trades are simulated against fetched books and never leave this machine.
+Scanning reads public market data. Trading signs orders with your demo API key and sends them to
+Kalshi's demo exchange, which runs on mock funds; karb refuses to sign a request for any other
+host (docs/decisions/ADR-0010).
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
@@ -30,10 +33,10 @@ from rich.text import Text
 from karb.arb.detect import DetectConfig, Detection, EventSnapshot, detect
 from karb.arb.screen import ScreenHit, screen_event
 from karb.core.clock import SystemClock
-from karb.core.fixed import Cash, FixedPointError
+from karb.core.fixed import Cash, FixedPointError, Price, Qty
 from karb.dashboard import collect_report, render_report
 from karb.demo import run_demo
-from karb.exchange.client import ClientStats, KalshiClient, KalshiError
+from karb.exchange.client import DEFAULT_BASE_URL, ClientStats, KalshiClient, KalshiError
 from karb.exchange.endpoints import (
     fetch_event,
     fetch_exchange_status,
@@ -44,12 +47,14 @@ from karb.exchange.endpoints import (
     trading_shards,
 )
 from karb.history import HistoryScreen, fetch_candles, minute_snapshots, screen_history
-from karb.market.book import OrderBook
-from karb.market.fees import CENT_BALANCE_UNIT, CENTICENT_BALANCE_UNIT, FeeConfig, RoundingMode
-from karb.paper.live import PaperTrader
-from karb.paper.replay import simulate_paper
-from karb.paper.settle import settle_open_trades
-from karb.paper.trade import PaperConfig
+from karb.market.book import OrderBook, Side
+from karb.market.fees import (
+    CENT_BALANCE_UNIT,
+    CENTICENT_BALANCE_UNIT,
+    FeeConfig,
+    RoundingMode,
+    resolve_fee_schedule,
+)
 from karb.render import (
     audit_view,
     explain_view,
@@ -59,19 +64,23 @@ from karb.render import (
     universe_view,
 )
 from karb.reports import (
+    account_view,
     history_view,
-    paper_replay_view,
-    paper_trader_view,
+    order_view,
+    orders_view,
+    plan_view,
     pnl_view,
     replay_view,
     runs_table,
     sensitivity_table,
     settle_view,
     stats_view,
+    trade_view,
+    trader_view,
 )
 from karb.scanner.service import CycleReport, ScanConfig, Scanner
 from karb.store.codec import detect_config_from_json
-from karb.store.database import LIVE_SOURCE, RecordStore, StoreError
+from karb.store.database import LIVE_SOURCE, RecordStore, StoreError, new_id
 from karb.store.recorder import Recorder
 from karb.store.replay import compare_with_live, replay_run
 from karb.store.stats import fee_sensitivity, run_statistics
@@ -81,11 +90,21 @@ from karb.structure.classify import (
     split_by_participant,
     tradeable_tickers,
 )
+from karb.trading.auth import DEMO_BASE_URL, Credentials, CredentialsError
+from karb.trading.engine import Trader
+from karb.trading.exercise import complete_set, fetch_event_snapshots
+from karb.trading.orders import Order, parse_fill
+from karb.trading.plan import TradeConfig, TradePlan
+from karb.trading.portfolio import fetch_balance, fetch_positions, place_orders
+from karb.trading.settle import EXCHANGE_SESSIONS, settle_open_trades
 
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
-    help="Structural arbitrage scanner for Kalshi event contracts. Public data, research only.",
+    help=(
+        "Structural arbitrage scanner for Kalshi event contracts. Scans public data; trades on "
+        "Kalshi's demo exchange (mock funds) only."
+    ),
 )
 console = Console()
 err_console = Console(stderr=True)
@@ -124,30 +143,44 @@ Database = Annotated[Path, typer.Option("--db", help="Recording database (a Duck
 RunId = Annotated[
     str | None, typer.Argument(help="Run id from `karb runs`. Defaults to the latest run.")
 ]
-MaxTradeCost = Annotated[
-    str, typer.Option(help="Paper budget per basket in dollars, fees included.")
-]
-Capital = Annotated[
-    str, typer.Option(help="Paper capital that open positions may tie up, in dollars.")
-]
+MaxTradeCost = Annotated[str, typer.Option(help="Budget per basket in dollars, fees included.")]
+Capital = Annotated[str, typer.Option(help="Cash that open positions may tie up, in dollars.")]
 NoHedge = Annotated[
     bool, typer.Option("--no-hedge", help="Hold whatever filled instead of repairing it.")
 ]
 Session = Annotated[
-    str | None, typer.Option("--session", help="Only this paper session (see `karb pnl`).")
+    str | None, typer.Option("--session", help="Only this trading session (see `karb pnl`).")
+]
+Yes = Annotated[bool, typer.Option("--yes", help="Send without asking for confirmation.")]
+Demo = Annotated[
+    bool, typer.Option("--demo", help="Read Kalshi's demo exchange instead of the real one.")
 ]
 
 
-def _paper_config(latency: float, max_trade_cost: str, capital: str, no_hedge: bool) -> PaperConfig:
+def _base_url(demo: bool) -> str:
+    return DEMO_BASE_URL if demo else DEFAULT_BASE_URL
+
+
+def _trade_config(
+    max_trade_cost: str, capital: str, no_hedge: bool, max_trades: int | None = None
+) -> TradeConfig:
     try:
-        return PaperConfig(
-            latency=latency,
+        return TradeConfig(
             max_cost_per_trade=Cash.parse(max_trade_cost),
             capital=Cash.parse(capital),
             hedge=not no_hedge,
+            max_trades=max_trades,
         )
     except (FixedPointError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _credentials() -> Credentials:
+    try:
+        return Credentials.from_env()
+    except CredentialsError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
 
 
 def _detect_config(
@@ -201,15 +234,6 @@ def scan(
     duration: Annotated[
         float | None, typer.Option(help="Stop after this many seconds (continuous mode).")
     ] = None,
-    paper: Annotated[
-        bool, typer.Option("--paper", help="Paper-trade every new opportunity (needs --record).")
-    ] = False,
-    latency: Annotated[
-        float, typer.Option(help="Paper trading: seconds from seeing a book to orders arriving.")
-    ] = 1.0,
-    max_trade_cost: MaxTradeCost = "100",
-    capital: Capital = "10000",
-    no_hedge: NoHedge = False,
     min_profit: MinProfit = "0.01",
     rounding: Rounding = RoundingMode.WORST_CASE,
     direct_member: DirectMember = False,
@@ -220,8 +244,6 @@ def scan(
     rate: Rate = 8.0,
 ) -> None:
     """Scan for structural arbitrage: discover, screen, confirm against live order books."""
-    if paper and record is None:
-        raise typer.BadParameter("--paper needs --record: paper trades are kept in the recording")
     config = ScanConfig(
         detect=_detect_config(
             min_profit, rounding, direct_member, taker_coefficient, levels, min_apr
@@ -233,32 +255,39 @@ def scan(
         confirm_all=confirm_all,
         confirmations=confirmations,
     )
-    paper_config = _paper_config(latency, max_trade_cost, capital, no_hedge) if paper else None
+    _run_scan(
+        config,
+        once=once,
+        as_json=as_json,
+        show_candidates=show_candidates,
+        rate=rate,
+        record=record,
+        duration=duration,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Trading:
+    credentials: Credentials
+    config: TradeConfig
+    stop_file: Path | None
+
+
+def _run_scan(config: ScanConfig, **options: object) -> None:
     try:
-        asyncio.run(
-            _scan(
-                config,
-                once=once,
-                as_json=as_json,
-                show_candidates=show_candidates,
-                rate=rate,
-                record=record,
-                paper=paper_config,
-                duration=duration,
-            )
-        )
+        asyncio.run(_scan(config, **options))  # type: ignore[arg-type]
     except KeyboardInterrupt:
         err_console.print("stopped")
     except KalshiError as exc:
         err_console.print(f"[red]Kalshi API unavailable:[/red] {exc}")
         raise typer.Exit(1) from exc
-    except StoreError as exc:
+    except (StoreError, CredentialsError) as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
 
 
 def _cycle_hook(
-    scanner: Scanner, recorder: Recorder | None, trader: PaperTrader | None
+    scanner: Scanner, recorder: Recorder | None, trader: Trader | None
 ) -> Callable[[CycleReport], None]:
     def handle(report: CycleReport) -> None:
         if recorder is None:
@@ -280,84 +309,127 @@ async def _scan(
     show_candidates: bool,
     rate: float,
     record: Path | None,
-    paper: PaperConfig | None,
     duration: float | None,
+    base_url: str = DEFAULT_BASE_URL,
+    trading: _Trading | None = None,
 ) -> None:
     store = None if record is None else RecordStore(record)
     recorder: Recorder | None = None
-    trader: PaperTrader | None = None
+    trader: Trader | None = None
     try:
-        async with KalshiClient(rate=rate) as client:
+        async with AsyncExitStack() as stack:
+            client = await stack.enter_async_context(KalshiClient(base_url=base_url, rate=rate))
             if store is not None:
                 recorder = Recorder(store, client.clock)
                 run_id = recorder.start_run(config)
                 err_console.print(f"recording run {run_id} to {record}")
-                if paper is not None:
-                    trader = PaperTrader(
-                        client, store, run_id=run_id, detect_config=config.detect, config=paper
+                if trading is not None:
+                    signed = await stack.enter_async_context(
+                        KalshiClient(base_url=base_url, rate=rate, credentials=trading.credentials)
                     )
-                    err_console.print(f"paper trading as session {trader.paper_id}")
-            if once:
-                with err_console.status("Starting", spinner="dots") as status:
-                    scanner = Scanner(
-                        client, config, progress=status.update, record_payloads=store is not None
+                    trader = Trader(
+                        signed,
+                        store,
+                        run_id=run_id,
+                        detect_config=config.detect,
+                        config=trading.config,
+                        environment="demo",
+                        stop_file=trading.stop_file,
                     )
-                    report = await scanner.run_once(on_cycle=_cycle_hook(scanner, recorder, trader))
-                    if trader is not None:
-                        status.update(f"Finishing {trader.pending} paper trade(s)")
-                        await trader.drain()
-                _emit_final(
-                    scanner, report, client.stats, as_json=as_json, show_candidates=show_candidates
+                    err_console.print(
+                        f"trading on Kalshi's demo exchange (mock funds) as session "
+                        f"{trader.session_id}; create {trading.stop_file} to halt trading"
+                    )
+            try:
+                await _scan_loop(
+                    client,
+                    config,
+                    recorder,
+                    trader,
+                    once=once,
+                    as_json=as_json,
+                    show_candidates=show_candidates,
+                    record_payloads=store is not None,
+                    duration=duration,
                 )
+            except asyncio.CancelledError:  # Ctrl+C: send nothing new
                 if trader is not None:
-                    err_console.print(paper_trader_view(trader))
-                return
-
-            scanner = Scanner(client, config, record_payloads=store is not None)
-            record_cycle = _cycle_hook(scanner, recorder, trader)
-            printed: set[str] = set()
-            last_view: list[RenderableType] = [Text("Starting")]
-            with Live(
-                Text("Starting"), console=err_console if as_json else console, refresh_per_second=4
-            ) as live:
-                scanner.progress = lambda message: live.update(Text(message))
-
-                def on_cycle(report: CycleReport) -> None:
-                    record_cycle(report)
-                    table = opportunities_table(
-                        scanner.tracker, now=report.finished_at, show_unconfirmed=show_candidates
-                    )
-                    view = Group(
-                        table,
-                        status_line(
-                            report, client.stats, scanner.tracker, outages=len(scanner.outages)
-                        ),
-                    )
-                    last_view[0] = view
-                    live.update(view)
-                    if not as_json:
-                        return
-                    for sighting in scanner.tracker.live():
-                        opportunity = sighting.opportunity
-                        if scanner.tracker.is_confirmed(sighting) and opportunity.id not in printed:
-                            printed.add(opportunity.id)
-                            record_json = opportunity_record(opportunity, sighting, confirmed=True)
-                            typer.echo(json.dumps(record_json))
-
-                await scanner.run_forever(on_cycle, stop_after=duration)
-                if trader is not None and trader.pending:
-                    note = Text(f"Finishing {trader.pending} paper trade(s)", style="dim")
-                    live.update(Group(last_view[0], note))
-                    await trader.drain()
-                live.update(last_view[0])
-            if trader is not None:
-                err_console.print(paper_trader_view(trader))
+                    trader.cancel_queued()
+                raise
+            finally:
+                if trader is not None:
+                    if trader.pending:
+                        # Never abandon a basket half-filled: finish the trade already sent.
+                        err_console.print(f"finishing {trader.pending} trade(s) before exiting")
+                        await asyncio.shield(trader.drain())
+                    err_console.print(trader_view(trader))
     finally:
         if recorder is not None and recorder.run_id is not None:
             recorder.finish_run()
             err_console.print(f"recorded {recorder.cycles:,} cycles as run {recorder.run_id}")
         if store is not None:
             store.close()
+
+
+async def _scan_loop(
+    client: KalshiClient,
+    config: ScanConfig,
+    recorder: Recorder | None,
+    trader: Trader | None,
+    *,
+    once: bool,
+    as_json: bool,
+    show_candidates: bool,
+    record_payloads: bool,
+    duration: float | None,
+) -> None:
+    if once:
+        with err_console.status("Starting", spinner="dots") as status:
+            scanner = Scanner(
+                client, config, progress=status.update, record_payloads=record_payloads
+            )
+            report = await scanner.run_once(on_cycle=_cycle_hook(scanner, recorder, trader))
+            if trader is not None:
+                status.update(f"Finishing {trader.pending} trade(s)")
+                await trader.drain()
+        _emit_final(scanner, report, client.stats, as_json=as_json, show_candidates=show_candidates)
+        return
+
+    scanner = Scanner(client, config, record_payloads=record_payloads)
+    record_cycle = _cycle_hook(scanner, recorder, trader)
+    printed: set[str] = set()
+    last_view: list[RenderableType] = [Text("Starting")]
+    with Live(
+        Text("Starting"), console=err_console if as_json else console, refresh_per_second=4
+    ) as live:
+        scanner.progress = lambda message: live.update(Text(message))
+
+        def on_cycle(report: CycleReport) -> None:
+            record_cycle(report)
+            table = opportunities_table(
+                scanner.tracker, now=report.finished_at, show_unconfirmed=show_candidates
+            )
+            view = Group(
+                table,
+                status_line(report, client.stats, scanner.tracker, outages=len(scanner.outages)),
+            )
+            last_view[0] = view
+            live.update(view)
+            if not as_json:
+                return
+            for sighting in scanner.tracker.live():
+                opportunity = sighting.opportunity
+                if scanner.tracker.is_confirmed(sighting) and opportunity.id not in printed:
+                    printed.add(opportunity.id)
+                    record_json = opportunity_record(opportunity, sighting, confirmed=True)
+                    typer.echo(json.dumps(record_json))
+
+        await scanner.run_forever(on_cycle, stop_after=duration)
+        if trader is not None and trader.pending:
+            note = Text(f"Finishing {trader.pending} trade(s)", style="dim")
+            live.update(Group(last_view[0], note))
+            await trader.drain()
+        live.update(last_view[0])
 
 
 def _emit_final(
@@ -401,12 +473,13 @@ def events(
         list[str], typer.Option("--series", "-s", help="Series to list, e.g. KXINX (repeatable).")
     ],
     limit: Annotated[int, typer.Option(help="Most events to show per series.")] = 20,
+    demo: Demo = False,
     rate: Rate = 8.0,
 ) -> None:
     """List open events in a series, with how karb classifies each: tickers for audit/explain."""
 
     async def run() -> None:
-        async with KalshiClient(rate=rate) as client:
+        async with KalshiClient(base_url=_base_url(demo), rate=rate) as client:
             table = Table(title="Open events", header_style="bold")
             for name in ("Event", "Title", "Markets", "Structure"):
                 table.add_column(name)
@@ -487,10 +560,14 @@ class _Inspection:
 
 
 async def _inspect(
-    event_ticker: str, config: DetectConfig, asserted: frozenset[str], rate: float
+    event_ticker: str,
+    config: DetectConfig,
+    asserted: frozenset[str],
+    rate: float,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> list[_Inspection]:
     """Classify and price one event -- each participant group separately -- on live books."""
-    async with KalshiClient(rate=rate) as client:
+    async with KalshiClient(base_url=base_url, rate=rate) as client:
         shards = trading_shards(await fetch_exchange_status(client))
         event = await fetch_event(client, event_ticker)
         series = await fetch_one_series(client, event.series_ticker)
@@ -542,13 +619,16 @@ def audit(
     levels: Levels = 10,
     min_apr: MinApr = None,
     assert_exhaustive: AssertExhaustive = None,
+    demo: Demo = False,
     rate: Rate = 8.0,
 ) -> None:
     """Show how one event is modelled: intervals, outcome spaces, fees, screens, LP, verdict."""
     config = _detect_config(min_profit, rounding, direct_member, taker_coefficient, levels, min_apr)
 
     async def run() -> None:
-        inspections = await _inspect(event_ticker, config, frozenset(assert_exhaustive or ()), rate)
+        inspections = await _inspect(
+            event_ticker, config, frozenset(assert_exhaustive or ()), rate, _base_url(demo)
+        )
         _print_inspections(inspections, explain=False)
 
     _run(run())
@@ -564,13 +644,16 @@ def explain(
     levels: Levels = 10,
     min_apr: MinApr = None,
     assert_exhaustive: AssertExhaustive = None,
+    demo: Demo = False,
     rate: Rate = 8.0,
 ) -> None:
     """Price one event's best basket fill by fill, with its payoff in every outcome."""
     config = _detect_config(min_profit, rounding, direct_member, taker_coefficient, levels, min_apr)
 
     async def run() -> None:
-        inspections = await _inspect(event_ticker, config, frozenset(assert_exhaustive or ()), rate)
+        inspections = await _inspect(
+            event_ticker, config, frozenset(assert_exhaustive or ()), rate, _base_url(demo)
+        )
         _print_inspections(inspections, explain=True)
 
     _run(run())
@@ -781,82 +864,280 @@ def history(
     _run(run())
 
 
-# ---- paper trading ------------------------------------------------------------------------------
-
-
-@app.command("paper-replay")
-def paper_replay(
-    run_id: RunId = None,
-    db: Database = DEFAULT_DB,
-    latency_cycles: Annotated[
-        int, typer.Option(help="Recorded observations between decision and arrival.")
-    ] = 1,
-    max_trade_cost: MaxTradeCost = "100",
-    capital: Capital = "10000",
-    no_hedge: NoHedge = False,
-    min_profit: Annotated[
-        str | None, typer.Option(help="Override the recorded minimum profit, in dollars.")
-    ] = None,
-    rounding: Annotated[
-        RoundingMode | None, typer.Option(help="Override the recorded fee rounding model.")
-    ] = None,
-    direct_member: Annotated[
-        bool | None,
-        typer.Option("--direct-member/--no-direct-member", help="Override balance precision."),
-    ] = None,
-    taker_coefficient: Annotated[
-        str | None, typer.Option(help="Override the recorded taker fee coefficient.")
-    ] = None,
-    min_apr: MinApr = None,
-) -> None:
-    """Paper-trade a recorded run: decide on one snapshot, fill on a later one."""
-    paper_config = _paper_config(0.0, max_trade_cost, capital, no_hedge)
-    with _open_store(db, write=True) as store:
-        resolved = _resolve_run(store, run_id)
-        run = store.run(resolved)
-        config = _override(
-            detect_config_from_json(run.config["detect"]),
-            min_profit=min_profit,
-            rounding=rounding,
-            direct_member=direct_member,
-            taker_coefficient=taker_coefficient,
-            levels=None,
-            min_apr=min_apr,
-        )
-        asserted = frozenset(run.config.get("asserted_exhaustive", []))
-        with err_console.status(f"Paper trading {run.observations:,} recorded observations"):
-            result = simulate_paper(
-                store,
-                resolved,
-                config,
-                paper_config,
-                latency_cycles=latency_cycles,
-                asserted_exhaustive=asserted,
-            )
-        console.print(paper_replay_view(result))
-        console.print(
-            pnl_view(store.paper_trades(paper_id=result.paper_id), store.paper_sessions())
-        )
+# ---- trading on Kalshi's demo exchange ----------------------------------------------------------
 
 
 @app.command()
-def settle(db: Database = DEFAULT_DB, session: Session = None, rate: Rate = 8.0) -> None:
-    """Settle open paper trades whose markets have finalized, and audit them against the model."""
+def account(
+    fills: Annotated[int, typer.Option(help="Recent fills to show.")] = 10,
+    rate: Rate = 8.0,
+) -> None:
+    """Your Kalshi demo account: balance, open positions and recent fills. Checks your API key."""
+    credentials = _credentials()
 
     async def run() -> None:
-        with _open_store(db, write=True) as store:
-            async with KalshiClient(rate=rate) as client:
-                summary = await settle_open_trades(store, client, paper_id=session)
-            console.print(settle_view(summary))
+        async with KalshiClient(
+            base_url=DEMO_BASE_URL, rate=rate, credentials=credentials
+        ) as client:
+            balance = await fetch_balance(client)
+            positions = await fetch_positions(client, None)
+            payload = await client.get("/portfolio/fills", [("limit", fills)], auth=True)
+            recent: list[tuple[str, str]] = []
+            for raw in payload.get("fills") or []:
+                fill = parse_fill(raw)
+                recent.append(
+                    (
+                        str(raw.get("created_time") or ""),
+                        f"{fill.ticker}: bought {fill.qty} {fill.side.value.upper()} at "
+                        f"{fill.price}, fee {fill.fee.dollars(6)}",
+                    )
+                )
+        console.print(f"signed in as key {credentials.key_id[:8]}... ({credentials.algorithm})")
+        console.print(account_view(balance, positions, recent))
 
     _run(run())
 
 
 @app.command()
-def pnl(db: Database = DEFAULT_DB, session: Session = None) -> None:
-    """Paper trades and their P&L attribution: planned, execution, hedging, settlement."""
+def order(
+    ticker: Annotated[str, typer.Argument(help="Market ticker on the demo exchange.")],
+    side: Annotated[Side, typer.Option(help="Which side to buy.")],
+    limit: Annotated[str, typer.Option(help="Most to pay per contract, in dollars.")],
+    qty: Annotated[str, typer.Option(help="Contracts to buy.")] = "1",
+    yes: Yes = False,
+    rate: Rate = 8.0,
+) -> None:
+    """Send one immediate-or-cancel buy to Kalshi's demo exchange and show its fills."""
+    try:
+        wanted = Order(ticker, side, Price.parse(limit), Qty.parse(qty))
+    except FixedPointError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if wanted.qty.is_zero:
+        raise typer.BadParameter("buy at least 0.01 contracts")
+    credentials = _credentials()
+    console.print(
+        f"buy {wanted.qty} {side.value.upper()} of {ticker} at no more than {wanted.limit}, "
+        "immediate-or-cancel, on Kalshi's demo exchange (mock funds)"
+    )
+    if not yes and not typer.confirm("Send it?"):
+        console.print("nothing sent")
+        return
+
+    async def run() -> None:
+        async with KalshiClient(
+            base_url=DEMO_BASE_URL, rate=rate, credentials=credentials
+        ) as client:
+            market = await client.get(f"/markets/{ticker}")
+            event = await fetch_event(client, str(market["market"]["event_ticker"]))
+            series = await fetch_one_series(client, event.series_ticker)
+            schedule = resolve_fee_schedule(event, series).schedule
+            now = client.clock.now()
+            placed = await place_orders(
+                client,
+                [wanted],
+                trade_id=f"order-{new_id(now)}",
+                phase="manual",
+                since=now - timedelta(seconds=5),
+            )
+        model = Cash.ZERO if schedule is None else placed[0].model_fees(schedule, FeeConfig())
+        console.print(order_view(placed[0], model))
+
+    _run(run())
+
+
+@app.command()
+def trade(
+    db: Annotated[
+        Path, typer.Option("--db", help="Recording database; every order and trade is kept here.")
+    ] = Path("data/trading.duckdb"),
+    exercise: Annotated[
+        str | None,
+        typer.Option(
+            "--exercise",
+            help="Instead of scanning, buy complete sets on this event to exercise trading.",
+        ),
+    ] = None,
+    sets: Annotated[int, typer.Option(help="Complete sets to buy with --exercise.")] = 1,
+    yes: Yes = False,
+    once: Annotated[bool, typer.Option("--once", help="One full pass, then exit.")] = False,
+    duration: Annotated[float | None, typer.Option(help="Stop after this many seconds.")] = None,
+    series: Series = None,
+    max_pages: MaxPages = None,
+    watchlist: Annotated[
+        int, typer.Option(help="Most liquid eligible events confirmed each cycle.")
+    ] = 40,
+    max_trade_cost: MaxTradeCost = "100",
+    capital: Capital = "10000",
+    max_trades: Annotated[
+        int | None, typer.Option(help="Stop trading after this many trades.")
+    ] = None,
+    no_hedge: NoHedge = False,
+    stop_file: Annotated[
+        Path, typer.Option(help="Trading halts as soon as this file exists.")
+    ] = Path("data/STOP"),
+    min_profit: MinProfit = "0.01",
+    rounding: Rounding = RoundingMode.WORST_CASE,
+    direct_member: DirectMember = False,
+    taker_coefficient: TakerCoefficient = "0.07",
+    levels: Levels = 10,
+    min_apr: MinApr = None,
+    assert_exhaustive: AssertExhaustive = None,
+    rate: Rate = 8.0,
+) -> None:
+    """Scan Kalshi's demo exchange and trade every verified opportunity there (mock funds)."""
+    credentials = _credentials()
+    detect_config = _detect_config(
+        min_profit, rounding, direct_member, taker_coefficient, levels, min_apr
+    )
+    trade_config = _trade_config(max_trade_cost, capital, no_hedge, max_trades)
+    if exercise is not None:
+        _exercise(exercise, sets, yes, db, credentials, detect_config, trade_config, rate)
+        return
+    config = ScanConfig(
+        detect=detect_config,
+        series=tuple(series or ()),
+        max_event_pages=max_pages,
+        asserted_exhaustive=frozenset(assert_exhaustive or ()),
+        watchlist_size=watchlist,
+        confirmations=1,
+    )
+    _run_scan(
+        config,
+        once=once,
+        as_json=False,
+        show_candidates=False,
+        rate=rate,
+        record=db,
+        duration=duration,
+        base_url=DEMO_BASE_URL,
+        trading=_Trading(credentials, trade_config, stop_file),
+    )
+
+
+def _exercise(
+    event_ticker: str,
+    sets: int,
+    yes: bool,
+    db: Path,
+    credentials: Credentials,
+    detect_config: DetectConfig,
+    trade_config: TradeConfig,
+    rate: float,
+) -> None:
+    async def prepare() -> tuple[EventSnapshot, TradePlan] | list[str]:
+        async with KalshiClient(base_url=DEMO_BASE_URL, rate=rate) as client:
+            snapshots, reasons = await fetch_event_snapshots(
+                client, event_ticker, max_levels=detect_config.max_levels
+            )
+        for snapshot in snapshots:
+            plan = complete_set(snapshot, sets=sets, fee_config=detect_config.fees)
+            if not isinstance(plan, str):
+                return snapshot, plan
+            reasons.append(f"{snapshot.structure.event.event_ticker}: {plan}")
+        return reasons
+
+    try:
+        prepared = asyncio.run(prepare())
+    except KalshiError as exc:
+        err_console.print(f"[red]Kalshi API error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    if isinstance(prepared, list):
+        err_console.print(f"nothing to exercise on {event_ticker}:")
+        for reason in prepared or ["no scannable groups"]:
+            err_console.print(f"  {reason}")
+        raise typer.Exit(1)
+    snapshot, plan = prepared
+    if plan.planned_cost > trade_config.max_cost_per_trade:
+        err_console.print(
+            f"{sets} set(s) cost {plan.planned_cost.dollars()}, over the "
+            f"{trade_config.max_cost_per_trade.dollars()} per-trade budget (--max-trade-cost)"
+        )
+        raise typer.Exit(1)
+    console.print(plan_view(plan))
+    if not yes and not typer.confirm("Send these orders to Kalshi's demo exchange (mock funds)?"):
+        console.print("nothing sent")
+        return
+
+    async def send() -> None:
+        with RecordStore(db) as store:
+            async with KalshiClient(
+                base_url=DEMO_BASE_URL, rate=rate, credentials=credentials
+            ) as client:
+                trader = Trader(
+                    client,
+                    store,
+                    run_id="exercise",
+                    detect_config=detect_config,
+                    config=trade_config,
+                    environment="demo",
+                )
+                outcome = await trader.execute(plan, snapshot)
+            console.print(trader_view(trader))
+            if outcome is not None:
+                console.print(trade_view(outcome))
+                console.print(f"recorded in {db}: karb pnl --db {db}")
+
+    _run(send())
+
+
+@app.command()
+def settle(db: Database = DEFAULT_DB, session: Session = None, rate: Rate = 8.0) -> None:
+    """Settle open trades whose markets have finalized, and audit them against the model."""
+
+    async def run() -> None:
+        with _open_store(db, write=True) as store:
+            open_sessions = {t.session_id for t in store.trades(session_id=session, status="open")}
+            sessions = [s for s in store.sessions() if s.session_id in open_sessions]
+            if not sessions:
+                console.print("no open trades to settle")
+                return
+            credentials: Credentials | None = None
+            asked = False
+            for row in sessions:
+                if row.kind == "simulated":
+                    console.print(
+                        f"session {row.session_id} traded a simulated exchange: karb demo settles it"
+                    )
+                    continue
+                base_url = DEFAULT_BASE_URL
+                if row.kind in EXCHANGE_SESSIONS:
+                    base_url = DEMO_BASE_URL
+                    if not asked:
+                        asked = True
+                        try:
+                            credentials = Credentials.from_env()
+                        except CredentialsError:
+                            console.print(
+                                "no demo API key set: settling from public results, without "
+                                "checking the exchange's settlement records"
+                            )
+                async with KalshiClient(
+                    base_url=base_url,
+                    rate=rate,
+                    credentials=credentials if row.kind in EXCHANGE_SESSIONS else None,
+                ) as client:
+                    summary = await settle_open_trades(store, client, session_id=row.session_id)
+                console.print(f"session {row.session_id}:")
+                console.print(settle_view(summary))
+
+    _run(run())
+
+
+@app.command()
+def pnl(
+    db: Database = DEFAULT_DB,
+    session: Session = None,
+    orders: Annotated[
+        bool, typer.Option("--orders", help="Also show every order as the exchange recorded it.")
+    ] = False,
+) -> None:
+    """Trades and their P&L attribution: planned, execution, repair, settlement."""
     with _open_store(db) as store:
-        console.print(pnl_view(store.paper_trades(paper_id=session), store.paper_sessions()))
+        trades = store.trades(session_id=session)
+        console.print(pnl_view(trades, store.sessions()))
+        if orders:
+            for row in trades:
+                console.print(orders_view(row, store.trade_orders(row.trade_id)))
 
 
 @app.command()
@@ -893,7 +1174,7 @@ def demo(
         bool, typer.Option("--overwrite", help="Replace an existing demo recording.")
     ] = False,
 ) -> None:
-    """Build an offline demo recording: scan a simulated exchange, paper-trade, settle."""
+    """Build an offline demo recording: scan a simulated exchange, trade it, settle."""
     if db.exists():
         if not overwrite:
             err_console.print(f"{db} exists; pass --overwrite to replace it")
@@ -907,11 +1188,14 @@ def demo(
     lines = [
         f"demo recording written to {db}",
         f"  run {summary.run_id}: {summary.cycles} cycles over 3 simulated events",
-        f"  paper session {summary.paper_id}: {summary.trades} trades, "
+        f"  trading session {summary.session_id}: {summary.trades} trades, "
         f"{settlement.settled} settled, realized {summary.realized.dollars()}",
-        "next: karb runs | replay | stats | sensitivity | paper-replay | pnl | report "
+        f"  simulated account balance {summary.balance.dollars()} (from $10,000.00)",
+        "next: karb runs | replay | stats | sensitivity | pnl | report "
         f"--db {db}  (walkthrough: docs/guide.md)",
     ]
+    if summary.halted:
+        lines.insert(3, f"  TRADING HALTED: {summary.halted}")
     console.print("\n".join(lines))
 
 

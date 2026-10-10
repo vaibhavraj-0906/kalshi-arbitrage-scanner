@@ -9,6 +9,9 @@ improves the exact, fee-rounded worst case.
 
 The hedge only trades markets already in the position. Searching the whole event could turn up a
 fresh, unrelated arbitrage, which would then be booked as "hedging" in the attribution.
+
+The books are fetched after the entry orders have executed, so they already lack the size the
+entry took. Nothing has to be remembered between the two.
 """
 
 from __future__ import annotations
@@ -22,8 +25,8 @@ from karb.arb.verify import payoff_by_atom
 from karb.core.fixed import Cash
 from karb.market.book import OrderBook, Side
 from karb.market.fees import FeeConfig, FeeSchedule, taker_buy_cost
-from karb.paper.execution import Liquidity, Order, position_cost
 from karb.structure.intervals import OutcomeSpace
+from karb.trading.orders import Order, position_cost, walk
 
 __all__ = ["decide_hedge", "worst_and_best"]
 
@@ -40,7 +43,6 @@ def worst_and_best(space: OutcomeSpace, legs: Sequence[LegFill]) -> tuple[Cash, 
 def decide_hedge(
     space: OutcomeSpace,
     books: Mapping[str, OrderBook],
-    liquidity: Liquidity,
     position: Sequence[LegFill],
     tradeable: frozenset[str],
     fees: FeeSchedule,
@@ -64,8 +66,8 @@ def decide_hedge(
             LegQuotes(
                 ticker,
                 space.yes_atoms[ticker],
-                liquidity.asks(books[ticker], Side.YES)[:max_levels],
-                liquidity.asks(books[ticker], Side.NO)[:max_levels],
+                books[ticker].asks(Side.YES)[:max_levels],
+                books[ticker].asks(Side.NO)[:max_levels],
             )
             for ticker in tickers
         ],
@@ -79,11 +81,10 @@ def decide_hedge(
     best_value, _ = worst_and_best(space, position)
     best_orders: tuple[Order, ...] = ()
     for candidate in whole_contract_candidates(solution):
-        trial = liquidity.copy()
         orders: list[Order] = []
         added: list[LegFill] = []
         for (ticker, side), qty in sorted(candidate.items()):
-            fills = trial.take(books[ticker], side, qty, None)
+            fills = walk(books[ticker], side, qty, None)
             if not fills:
                 continue
             cost = taker_buy_cost(fills, fees, config)

@@ -30,7 +30,7 @@ from karb.arb.lp import PROFIT_TOLERANCE
 from karb.core.fixed import Cash
 from karb.render import duration
 from karb.store.codec import detect_config_from_json, from_ns
-from karb.store.database import LIVE_SOURCE, PaperSessionRow, PaperTradeRow, RecordStore, RunInfo
+from karb.store.database import LIVE_SOURCE, RecordStore, RunInfo, SessionRow, TradeRow
 from karb.store.stats import (
     Episode,
     RunStatistics,
@@ -61,8 +61,8 @@ class ReportData:
     cycle_gaps: list[float]
     """Seconds between consecutive cycle starts."""
     sensitivity: list[SensitivityRow] | None
-    sessions: list[PaperSessionRow]
-    trades: list[PaperTradeRow]
+    sessions: list[SessionRow]
+    trades: list[TradeRow]
     generated_at: datetime
 
 
@@ -78,9 +78,9 @@ def collect_report(
         recorded = detect_config_from_json(run.config["detect"])
         asserted = frozenset(run.config.get("asserted_exhaustive", []))
         rows = fee_sensitivity(store, run_id, recorded, asserted_exhaustive=asserted)
-    sessions = [s for s in store.paper_sessions() if s.run_id == run_id]
-    ids = {s.paper_id for s in sessions}
-    trades = [t for t in store.paper_trades() if t.paper_id in ids]
+    sessions = [s for s in store.sessions() if s.run_id == run_id]
+    ids = {s.session_id for s in sessions}
+    trades = [t for t in store.trades() if t.session_id in ids]
     return ReportData(
         run=run,
         stats=stats,
@@ -115,9 +115,9 @@ def fee_coefficient(text: object) -> str:
         return "?"
 
 
-def trade_number(trade: PaperTradeRow) -> str:
+def trade_number(trade: TradeRow) -> str:
     """Short and unique across sessions: the session's suffix and the trade's sequence."""
-    return f"{trade.paper_id[-6:]}/{trade.trade_id.rsplit('-', 1)[-1]}"
+    return f"{trade.session_id[-6:]}/{trade.trade_id.rsplit('-', 1)[-1]}"
 
 
 def _tile(label: str, value: str, note: str = "") -> str:
@@ -266,9 +266,9 @@ def _kpis(data: ReportData) -> str:
         _tile("Solver-positive snapshots", _count(data.solver_positive), "before fee rounding"),
         _tile("Verified snapshots", _count(stats.verified_observations), "after fees and rounding"),
         _tile("Distinct opportunities", _count(len(stats.episodes))),
-        _tile("Paper trades", _count(len(data.trades))),
+        _tile("Trades", _count(len(data.trades))),
         _tile(
-            "Realized paper P&L",
+            "Realized P&L",
             _money(realized) if final else "-",
             f"{len(final)} final trade(s)" if final else "nothing settled yet",
         ),
@@ -283,10 +283,10 @@ def _funnel(data: ReportData) -> str:
         ("Solver-positive before rounding", data.solver_positive),
         ("Verified after fees and rounding", stats.verified_observations),
         ("Distinct opportunities", len(stats.episodes)),
-        ("Paper trades", len(data.trades)),
+        ("Trades", len(data.trades)),
     ]
     rows = [(label, n, _count(n), f"stage-{i + 1}") for i, (label, n) in enumerate(stages)]
-    chart = _hbars(rows, aria="Funnel from snapshots to paper trades")
+    chart = _hbars(rows, aria="Funnel from snapshots to trades")
     table = _table(["Stage", "Count"], [(label, _count(n)) for label, n in stages])
     return _figure(
         "Where the edge goes",
@@ -369,15 +369,15 @@ def _lifetimes(episodes: Sequence[Episode]) -> str:
     )
 
 
-def _paper(data: ReportData) -> str:
-    title = "Paper trading: where the planned edge went"
+def _trading(data: ReportData) -> str:
+    title = "Trading: where the planned edge went"
     trades = data.trades
     if not data.sessions:
-        return _empty(title, "This run was recorded without --paper, and no paper replay used it.")
+        return _empty(title, "This run was recorded without trading: see karb trade.")
     if not trades:
         return _empty(
             title,
-            "Paper trading ran, but no opportunity cleared the budget and minimum-profit checks, "
+            "Trading was on, but no opportunity cleared the budget and minimum-profit checks, "
             "so nothing was traded.",
         )
     final = [t for t in trades if t.realized_pnl is not None]
@@ -426,7 +426,7 @@ def _paper(data: ReportData) -> str:
             )
         )
     else:
-        parts.append(_empty(title, "No paper trade has settled yet: run karb settle later."))
+        parts.append(_empty(title, "No trade has settled yet: run karb settle later."))
 
     rows = [
         (
@@ -445,7 +445,7 @@ def _paper(data: ReportData) -> str:
     ]
     guaranteed = sum(t.worst_after_hedge for t in open_trades)
     parts.append(
-        '<section class="card"><h2>Paper trades</h2>'
+        '<section class="card"><h2>Trades</h2>'
         f'<p class="sub">{len(open_trades)} open, holding at least {_e(_money(guaranteed))} '
         "guaranteed until settlement.</p>"
         + '<div class="scroll">'
@@ -497,10 +497,11 @@ verifies it (ADR-0003).</li>
 against the trader; no rebates assumed unless stated (ADR-0002).</li>
 <li>Lifetimes are lower bounds: groups are observed only when confirmed, every few seconds, over a
 lossy public REST connection (ADR-0004).</li>
-<li>Paper trades decide on one book and fill on a book fetched a latency later; liquidity taken
-stays taken; partial fills are repaired with the same LP; settlement audits the contract reading
-(ADR-0008).</li>
-<li>Public data only, research only: nothing here can place an order.</li>
+<li>Trades are immediate-or-cancel orders on Kalshi's demo exchange (mock funds) or a local
+simulated exchange, priced with the fees the exchange charged; partial fills are repaired with the
+same LP; settlement audits the contract reading (ADR-0008, ADR-0010).</li>
+<li>Recordings made before ADR-0010 hold paper trades, simulated against fetched books.</li>
+<li>Nothing in karb can trade real money: it signs requests for the demo exchange only.</li>
 </ul></section>
 """
 
@@ -623,7 +624,7 @@ def render_report(data: ReportData) -> str:
         _funnel(data),
         _sensitivity(data.sensitivity) if data.sensitivity is not None else "",
         _lifetimes(data.stats.episodes),
-        _paper(data),
+        _trading(data),
         _screens(data.stats),
         _METHOD,
     ]

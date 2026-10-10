@@ -1,4 +1,4 @@
-"""Settling paper positions against what the exchange actually decided (ADR-0008).
+"""Settling positions against what the exchange actually decided (ADR-0008, ADR-0010).
 
 A market is final when its status is ``finalized``. ``determined`` -- a result announced but not
 yet final -- can still be disputed or amended, so it waits. What one YES contract paid comes from
@@ -8,6 +8,10 @@ paid the complement.
 Settlement is also the scanner's only external audit. A position's guaranteed P&L was computed
 from karb's reading of the contracts. If the exchange pays less than that guarantee, the reading
 was wrong somewhere, and the trade is flagged as a model violation rather than averaged away.
+
+For trades placed on an exchange, karb also asks the exchange what it paid
+(``GET /portfolio/settlements``). The two must agree once the cash returned at execution by
+netting YES against NO is counted: a disagreement is reported, never silently reconciled.
 """
 
 from __future__ import annotations
@@ -22,7 +26,8 @@ from karb.core.fixed import Cash, Price, Qty
 from karb.exchange.client import KalshiClient, KalshiHTTPError
 from karb.market.book import Side
 from karb.store.codec import to_ns
-from karb.store.database import PaperOrderRow, RecordStore, SettlementRow
+from karb.store.database import RecordStore, SettlementRow, TradeOrderRow
+from karb.trading.portfolio import fetch_settlements
 from karb.wire.models import MarketWire
 
 __all__ = [
@@ -37,6 +42,8 @@ __all__ = [
 ]
 
 FINAL_STATUS: Final = "finalized"
+EXCHANGE_SESSIONS: Final = frozenset({"demo", "simulated"})
+"""Session kinds whose trades the exchange itself can report on."""
 _TICKERS_PER_REQUEST: Final = 50
 
 
@@ -92,7 +99,7 @@ async def fetch_market_results(
     return results
 
 
-def holdings(orders: Iterable[PaperOrderRow]) -> list[tuple[str, Side, Qty]]:
+def holdings(orders: Iterable[TradeOrderRow]) -> list[tuple[str, Side, Qty]]:
     """Contracts held after entry and hedge, by market and side."""
     held: dict[tuple[str, Side], int] = defaultdict(int)
     for order in orders:
@@ -123,15 +130,29 @@ class SettleSummary:
     violations: list[str] = field(default_factory=list)
     realized: Cash = Cash.ZERO
     markets: int = 0
+    exchange_checked: int = 0
+    exchange_mismatches: list[str] = field(default_factory=list)
+
+
+async def exchange_revenue(client: KalshiClient, event_ticker: str, tickers: Iterable[str]) -> Cash:
+    """What the exchange paid at settlement for ``tickers``, by its own account."""
+    wanted = set(tickers)
+    cents = sum(
+        int(row.get("revenue") or 0)
+        for row in await fetch_settlements(client, event_ticker)
+        if row.get("ticker") in wanted
+    )
+    return Cash(cents * 10_000)
 
 
 async def settle_open_trades(
-    store: RecordStore, client: KalshiClient, *, paper_id: str | None = None
+    store: RecordStore, client: KalshiClient, *, session_id: str | None = None
 ) -> SettleSummary:
-    """Settle every open paper trade whose markets are all final."""
+    """Settle every open trade whose markets are all final."""
     summary = SettleSummary()
-    trades = store.paper_trades(paper_id=paper_id, status="open")
-    positions = {trade.trade_id: holdings(store.paper_orders(trade.trade_id)) for trade in trades}
+    trades = store.trades(session_id=session_id, status="open")
+    kinds = {session.session_id: session.kind for session in store.sessions()}
+    positions = {trade.trade_id: holdings(store.trade_orders(trade.trade_id)) for trade in trades}
     tickers = sorted({ticker for held in positions.values() for ticker, _, _ in held})
     summary.markets = len(tickers)
     results = await fetch_market_results(client, tickers) if tickers else {}
@@ -161,7 +182,7 @@ async def settle_open_trades(
         settled_at = [
             moment for ticker, _, _ in held if (moment := results[ticker].settled_at) is not None
         ]
-        store.settle_paper_trade(
+        store.settle_trade(
             trade.trade_id,
             settled_ns=max((to_ns(moment) for moment in settled_at), default=now_ns),
             payout=payout.raw,
@@ -172,4 +193,15 @@ async def settle_open_trades(
         summary.realized = summary.realized + Cash(realized)
         if violation:
             summary.violations.append(trade.trade_id)
+        if client.authenticated and kinds.get(trade.session_id) in EXCHANGE_SESSIONS:
+            paid = await exchange_revenue(
+                client, trade.event_ticker.split("#", 1)[0], {t for t, _, _ in held}
+            )
+            expected = payout - Cash(trade.netted_cash or 0)
+            summary.exchange_checked += 1
+            if paid != expected:
+                summary.exchange_mismatches.append(
+                    f"{trade.trade_id}: the exchange paid {paid.dollars()}, the model "
+                    f"{expected.dollars()} after {Cash(trade.netted_cash or 0).dollars()} netted"
+                )
     return summary

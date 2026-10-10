@@ -11,10 +11,13 @@ __pycache__/
 # Runtime data -- caches and recordings are regenerated, never committed.
 data/
 
-# Secrets. Nothing in this project needs credentials; keep it that way.
+# Secrets. Demo trading reads an API key id and a private key file from environment variables;
+# keep the key outside the repository, and never commit one.
 .env
 .env.*
 !.env.example
+*.pem
+*.key
 
 # Editors / OS
 .vscode/

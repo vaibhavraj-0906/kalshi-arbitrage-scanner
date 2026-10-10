@@ -1,5 +1,5 @@
 """Terminal reports for recorded research: runs, replays, statistics, fee sensitivity, history,
-and paper trading."""
+and trading."""
 
 from __future__ import annotations
 
@@ -13,25 +13,30 @@ from rich.text import Text
 from karb.core.fixed import Cash, format_scaled
 from karb.dashboard import fee_coefficient, trade_number
 from karb.history import HistoryScreen
-from karb.paper.live import PaperTrader
-from karb.paper.replay import PaperReplay
-from karb.paper.settle import SettleSummary
 from karb.render import duration
 from karb.store.codec import from_ns
-from karb.store.database import PaperSessionRow, PaperTradeRow, RunInfo
+from karb.store.database import RunInfo, SessionRow, TradeOrderRow, TradeRow
 from karb.store.replay import ReplayComparison, ReplayOutcome
 from karb.store.stats import Episode, RunStatistics, SensitivityRow, quantile
+from karb.trading.engine import Trader
+from karb.trading.orders import PlacedOrder
+from karb.trading.plan import TradeOutcome, TradePlan
+from karb.trading.settle import SettleSummary
 
 __all__ = [
+    "account_view",
     "history_view",
-    "paper_replay_view",
-    "paper_trader_view",
+    "order_view",
+    "orders_view",
+    "plan_view",
     "pnl_view",
     "replay_view",
     "runs_table",
     "sensitivity_table",
     "settle_view",
     "stats_view",
+    "trade_view",
+    "trader_view",
 ]
 
 
@@ -274,7 +279,14 @@ def history_view(results: Sequence[HistoryScreen], *, hours: float) -> Group:
     return Group(table, caveat)
 
 
-# ---- paper trading ------------------------------------------------------------------------------
+# ---- trading ------------------------------------------------------------------------------------
+
+_SESSION_KINDS = {
+    "demo": "Kalshi demo",
+    "simulated": "simulated exchange",
+    "live": "paper (legacy)",
+    "replay": "paper replay (legacy)",
+}
 
 
 def _cash(raw: int | None, decimals: int = 2) -> str:
@@ -285,46 +297,39 @@ def _skips(skips: Counter[str]) -> str:
     return "; ".join(f"{reason} x{count}" for reason, count in skips.most_common())
 
 
-def pnl_view(trades: Sequence[PaperTradeRow], sessions: Sequence[PaperSessionRow]) -> Group:
-    """Every paper trade's attribution: planned + execution + hedging + outcome = realized."""
+def pnl_view(trades: Sequence[TradeRow], sessions: Sequence[SessionRow]) -> Group:
+    """Every trade's attribution: planned + execution + hedging + outcome = realized."""
     parts: list[Table | Text] = []
-    shown = {trade.paper_id for trade in trades}
+    shown = {trade.session_id for trade in trades}
     if sessions:
-        counts = Counter(trade.paper_id for trade in trades)
-        table = Table(title="Paper sessions", header_style="bold")
+        counts = Counter(trade.session_id for trade in trades)
+        table = Table(title="Trading sessions", header_style="bold")
         _columns(
             table,
             (
                 ("Session", "left"),
-                ("Kind", "left"),
+                ("Where", "left"),
                 ("Run", "left"),
-                ("Latency", "right"),
                 ("Budget / trade", "right"),
-                ("Hedge", "left"),
+                ("Repair", "left"),
                 ("Trades", "right"),
             ),
         )
         for session in sessions:
-            if shown and session.paper_id not in shown:
+            if shown and session.session_id not in shown:
                 continue
-            paper = session.config.get("paper", {})
-            latency = (
-                f"{session.config.get('latency_cycles', '?')} obs"
-                if session.kind == "replay"
-                else f"{paper.get('latency', '?')}s"
-            )
+            limits = session.config.get("trade") or session.config.get("paper") or {}
             table.add_row(
-                session.paper_id,
-                session.kind,
+                session.session_id,
+                _SESSION_KINDS.get(session.kind, session.kind),
                 session.run_id,
-                latency,
-                _cash(paper.get("max_cost_per_trade")),
-                "yes" if paper.get("hedge", True) else "no",
-                f"{counts.get(session.paper_id, 0):,}",
+                _cash(limits.get("max_cost_per_trade")),
+                "yes" if limits.get("hedge", True) else "no",
+                f"{counts.get(session.session_id, 0):,}",
             )
         parts.append(table)
 
-    table = Table(title="Paper trades (attribution telescopes to realized)", header_style="bold")
+    table = Table(title="Trades (attribution telescopes to realized)", header_style="bold")
     _columns(
         table,
         (
@@ -349,6 +354,8 @@ def pnl_view(trades: Sequence[PaperTradeRow], sessions: Sequence[PaperSessionRow
             trade.filled_contracts / trade.planned_contracts if trade.planned_contracts else 0.0
         )
         status = trade.status + (" - MODEL VIOLATION" if trade.model_violation else "")
+        if "AUDIT:" in trade.note:
+            status += " - AUDIT"
         table.add_row(
             trade_number(trade),
             f"{from_ns(trade.decided_ns):%m-%d %H:%M:%S}",
@@ -364,14 +371,13 @@ def pnl_view(trades: Sequence[PaperTradeRow], sessions: Sequence[PaperSessionRow
         )
     parts.append(table)
     if not trades:
-        table.caption = (
-            "No paper trades yet: karb scan --record FILE --paper, or karb paper-replay."
-        )
+        table.caption = "No trades yet: karb trade, or karb trade --exercise EVENT."
         return Group(*parts)
 
     settled = [t for t in trades if t.realized_pnl is not None]
     still_open = [t for t in trades if t.status == "open"]
     violations = [t for t in trades if t.model_violation]
+    audits = [t for t in trades if "AUDIT:" in t.note]
     lines = [
         f"{len(trades):,} trades: {len(settled):,} final ({_cash(sum(t.realized_pnl or 0 for t in settled))} "
         f"realized), {len(still_open):,} open (guaranteed at least "
@@ -386,42 +392,170 @@ def pnl_view(trades: Sequence[PaperTradeRow], sessions: Sequence[PaperSessionRow
             f"MODEL VIOLATIONS: {len(violations)} settled below their guaranteed worst case -- "
             "a contract was read wrong. Check: " + ", ".join(t.trade_id for t in violations[:5])
         )
+    for trade in audits[:5]:
+        lines.append(f"{trade.trade_id}: {trade.note[trade.note.index('AUDIT:') :]}")
     parts.append(Text("\n".join(lines)))
     return Group(*parts)
 
 
-def paper_replay_view(result: PaperReplay) -> Text:
-    statuses = Counter(outcome.status for outcome in result.outcomes)
+def plan_view(plan: TradePlan) -> Table:
+    """The orders about to be sent, priced on the decision book."""
+    opportunity = plan.opportunity
+    table = Table(
+        title=f"{opportunity.event_ticker}: {opportunity.kind} {opportunity.tier}",
+        header_style="bold",
+    )
+    _columns(
+        table,
+        (
+            ("Market", "left"),
+            ("Buy", "left"),
+            ("Contracts", "right"),
+            ("Limit", "right"),
+            ("Cost", "right"),
+        ),
+    )
+    for order, leg in zip(plan.orders, plan.basket.legs, strict=True):
+        table.add_row(
+            order.ticker,
+            order.side.value.upper(),
+            str(order.qty),
+            str(order.limit),
+            leg.order.cash_out.dollars(4),
+        )
+    table.caption = (
+        f"cost {plan.planned_cost.dollars(4)} including {plan.basket.fees.dollars(4)} fees | "
+        f"pays at least {plan.basket.min_payoff.dollars(4)} | guaranteed P&L "
+        f"{plan.planned_pnl.dollars(4)}"
+    )
+    return table
+
+
+def order_view(placed: PlacedOrder, model_fees: Cash) -> Text:
+    """One order as the exchange handled it, with its fees checked against the model."""
+    order = placed.order
     lines = [
-        f"paper session {result.paper_id} over run {result.run_id}: "
-        f"{result.decisions:,} observations with a verified opportunity, "
-        f"{len(result.outcomes):,} trades ({statuses['open']} open, {statuses['flat']} flat, "
-        f"{statuses['missed']} missed)"
+        f"{order.ticker}: buy {order.qty} {order.side.value.upper()} at no more than {order.limit}"
+        f" -> order {placed.order_id or 'not placed'}, filled {placed.filled}"
     ]
-    if result.skips:
-        lines.append(f"not traded: {_skips(result.skips)}")
+    for fill in placed.fills:
+        lines.append(f"  fill {fill.qty} at {fill.price}, fee {fill.fee.dollars(6)}")
+    if placed.fills:
+        verdict = "within" if placed.fees <= model_fees else "ABOVE"
+        lines.append(
+            f"  cash out {placed.cash_out.dollars(6)}; fees {placed.fees.dollars(6)} charged, "
+            f"{verdict} the model's {model_fees.dollars(6)}"
+        )
+    if placed.error:
+        lines.append(f"  error: {placed.error}")
     return Text("\n".join(lines))
 
 
-def paper_trader_view(trader: PaperTrader) -> Text:
-    statuses = Counter(outcome.status for outcome in trader.outcomes)
+def orders_view(trade: TradeRow, orders: Sequence[TradeOrderRow]) -> Table:
+    """One trade's orders: what was sent, what filled, and the fees against the model."""
+    table = Table(
+        title=f"Orders of trade {trade_number(trade)} ({trade.group_key})", header_style="bold"
+    )
+    _columns(
+        table,
+        (
+            ("Phase", "left"),
+            ("Market", "left"),
+            ("Buy", "left"),
+            ("Limit", "right"),
+            ("Ordered", "right"),
+            ("Filled", "right"),
+            ("Cash out", "right"),
+            ("Fees", "right"),
+            ("Model fees", "right"),
+            ("Exchange order", "left"),
+        ),
+    )
+    for row in orders:
+        if row.phase == "plan":
+            continue
+        table.add_row(
+            row.phase,
+            row.ticker,
+            row.side.upper(),
+            format_scaled(row.limit_price, 4),
+            format_scaled(row.ordered, 2),
+            format_scaled(row.filled, 2),
+            _cash(row.cash_out, 4),
+            _cash(row.fees, 4),
+            _cash(row.model_fees, 4),
+            row.order_id or (row.error or "-"),
+        )
+    parts = []
+    if trade.netted_cash:
+        parts.append(f"{_cash(trade.netted_cash)} returned at once by netting YES against NO")
+    if trade.balance_change is not None:
+        parts.append(f"account balance moved {_cash(trade.balance_change, 4)}")
+    if trade.note:
+        parts.append(trade.note)
+    table.caption = " | ".join(parts) or None
+    return table
+
+
+def trade_view(outcome: TradeOutcome) -> Text:
+    attribution = outcome.attribution
     lines = [
-        f"paper session {trader.paper_id}: {len(trader.outcomes):,} trades "
-        f"({statuses['open']} open, {statuses['flat']} flat, {statuses['missed']} missed); "
-        f"capital in use {trader.capital_in_use.dollars()}"
+        f"{outcome.plan.group_key}: {outcome.status}, entry filled "
+        f"{outcome.filled_contracts} of {outcome.planned_contracts} contracts",
+        f"planned {attribution.planned.dollars(4)} | after entry {attribution.after_entry.dollars(4)}"
+        f" | after repair {attribution.after_hedge.dollars(4)} (guaranteed, exchange fees)",
+        f"cost {(outcome.entry_cost + outcome.hedge_cost).dollars(4)}, netted back "
+        f"{outcome.netted_cash.dollars(2)}, balance moved "
+        f"{'-' if outcome.balance_change is None else outcome.balance_change.dollars(4)}",
+    ]
+    if outcome.note:
+        lines.append(outcome.note)
+    return Text("\n".join(lines))
+
+
+def trader_view(trader: Trader) -> Text:
+    statuses = Counter(outcome.status for outcome in trader.outcomes)
+    where = _SESSION_KINDS.get(trader.environment, trader.environment)
+    lines = [
+        f"trading session {trader.session_id} on the {where}: {len(trader.outcomes):,} trades "
+        f"({statuses['open']} open, {statuses['flat']} flat); capital in use "
+        f"{trader.capital_in_use.dollars()}"
     ]
     if trader.skips:
         lines.append(f"not traded: {_skips(trader.skips)}")
     lines.extend(f"error: {error}" for error in trader.errors)
+    if trader.halted:
+        lines.append(f"TRADING HALTED: {trader.halted}")
     return Text("\n".join(lines))
+
+
+def account_view(
+    balance: Cash, positions: dict[str, int], fills: Sequence[tuple[str, str]]
+) -> Group:
+    table = Table(title="Open positions", header_style="bold")
+    _columns(table, (("Market", "left"), ("Position", "right")))
+    for ticker, raw in sorted(positions.items()):
+        side = "YES" if raw > 0 else "NO"
+        table.add_row(ticker, f"{abs(raw) / 100:g} {side}")
+    if not positions:
+        table.caption = "No open positions."
+    lines = [f"balance {balance.dollars(2)} (Kalshi demo exchange, mock funds)"]
+    lines.extend(f"  {when}  {text}" for when, text in fills)
+    return Group(Text(lines[0]), table, Text("\n".join(lines[1:])) if fills else Text(""))
 
 
 def settle_view(summary: SettleSummary) -> Text:
     lines = [
-        f"checked {summary.checked:,} open paper trades across {summary.markets:,} markets: "
+        f"checked {summary.checked:,} open trades across {summary.markets:,} markets: "
         f"{summary.settled:,} settled ({summary.realized.dollars()} realized), "
         f"{summary.pending:,} waiting for finalized results"
     ]
+    if summary.exchange_checked:
+        agree = summary.exchange_checked - len(summary.exchange_mismatches)
+        lines.append(
+            f"exchange settlement records: {agree} of {summary.exchange_checked} agree with the model"
+        )
+    lines.extend(f"MISMATCH: {line}" for line in summary.exchange_mismatches)
     if summary.violations:
         lines.append(
             f"MODEL VIOLATIONS: {len(summary.violations)} paid less than their guaranteed worst "

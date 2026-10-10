@@ -4,6 +4,11 @@ On Friday 2026-10-09, karb recorded the whole open Kalshi universe for one hour 
 12:34–1:34 pm New York) with paper trading switched on. This page reports what it found. Every
 number comes from that recording and can be regenerated with the commands at the end.
 
+> **Note.** This session ran before Milestone 5 (ADR-0010). Its "paper trading" simulated fills
+> against fetched order books; no order reached an exchange. karb now trades with real signed
+> orders on Kalshi's demo exchange instead, and the `--paper` and `paper-replay` commands below
+> no longer exist. The findings about the real market are unaffected.
+
 The self-contained HTML report for the same run is [research-report.html](research-report.html).
 Download it and open it in a browser; GitHub shows HTML as source.
 
@@ -190,7 +195,7 @@ They stay open until the market settles; its latest expiration is 2037-12-31. At
 outcome column must come out non-negative. A negative value is flagged as a model violation.
 
 A trade that fills completely and waits eleven years is the least informative test of execution.
-The demo ([guide §3.6](guide.md#36-paper-trading-and-pl-attribution)) shows what the trader does
+The demo ([guide §3.6](guide.md#36-trading-and-pl-attribution)) shows what the trader does
 when a leg vanishes.
 
 ## The run that failed first

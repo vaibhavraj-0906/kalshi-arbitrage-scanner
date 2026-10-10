@@ -178,3 +178,67 @@ def test_trading_shards() -> None:
     assert trading_shards(status) == {0, 1, 2, 3}
     halted = status.model_copy(update={"trading_active": False})
     assert trading_shards(halted) == frozenset()
+
+
+# ---- signed writes ------------------------------------------------------------------------------
+
+
+def signed_client(handler: Callable[[httpx.Request], httpx.Response]) -> KalshiClient:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from karb.trading.auth import Credentials
+
+    clock = FakeClock(NOW)
+    return KalshiClient(
+        base_url=BASE,
+        transport=httpx.MockTransport(handler),
+        clock=clock,
+        sleep=SleepRecorder(clock),
+        rng=random.Random(7),
+        credentials=Credentials("kid", Ed25519PrivateKey.generate()),
+        sign_hosts=frozenset({"kalshi.test"}),
+    )
+
+
+async def test_an_order_post_is_retried_with_the_identical_body() -> None:
+    bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content)
+        if len(bodies) == 1:
+            raise httpx.ReadError("reset after the order was accepted", request=request)
+        return httpx.Response(201, json={"orders": []})
+
+    async with signed_client(handler) as client:
+        body = {"orders": [{"ticker": "T", "client_order_id": "same-id"}]}
+        assert await client.post("/portfolio/events/orders/batched", body, cost=1) == {"orders": []}
+    assert len(bodies) == 2 and bodies[0] == bodies[1]
+    assert json.loads(bodies[1])["orders"][0]["client_order_id"] == "same-id"
+
+
+async def test_conflicts_and_rejections_are_never_retried() -> None:
+    from karb.exchange.client import KalshiConflict
+
+    statuses = iter([409, 400])
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(next(statuses), json={"error": {"code": "x"}})
+
+    async with signed_client(handler) as client:
+        with pytest.raises(KalshiConflict):
+            await client.post("/portfolio/events/orders", {"ticker": "T"})
+        with pytest.raises(KalshiHTTPError, match="POST /portfolio/events/orders -> HTTP 400"):
+            await client.post("/portfolio/events/orders", {"ticker": "T"})
+    assert calls == 2
+
+
+async def test_a_batch_larger_than_the_write_bucket_is_refused_before_sending() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("nothing should be sent")
+
+    async with signed_client(handler) as client:
+        with pytest.raises(ValueError, match="never fit"):
+            await client.post("/portfolio/events/orders/batched", {"orders": []}, cost=11)

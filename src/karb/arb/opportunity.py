@@ -44,6 +44,9 @@ class ArbKind(StrEnum):
     """YES on two markets that cannot both resolve NO."""
     COMBO = "COMBO"
     """Any other basket the LP found."""
+    EXERCISE = "EXERCISE"
+    """A complete set bought on purpose to exercise trading (``karb trade --exercise``): it
+    pays exactly $1 a set and is usually a small known loss. Never reported as an opportunity."""
 
 
 @dataclass(frozen=True, slots=True)

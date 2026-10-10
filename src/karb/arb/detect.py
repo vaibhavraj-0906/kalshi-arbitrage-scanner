@@ -28,7 +28,15 @@ from karb.market.fees import FeeConfig
 from karb.structure.classify import EventStructure, Tier
 from karb.structure.intervals import OutcomeSpace
 
-__all__ = ["DetectConfig", "Detection", "EventSnapshot", "classify_basket", "detect"]
+__all__ = [
+    "DetectConfig",
+    "Detection",
+    "EventSnapshot",
+    "classify_basket",
+    "detect",
+    "opportunity_from_basket",
+    "whole_contract_candidates",
+]
 
 _SCALES = (1.0, 0.75, 0.5, 0.25, 0.1)
 DEFAULT_MIN_PROFIT = Cash(10_000)
@@ -101,7 +109,7 @@ def detect(snapshot: EventSnapshot, config: DetectConfig) -> Detection:
             continue
         basket = _best_verified(space, usable, solution, structure, config)
         if basket is not None and basket.guaranteed_pnl >= config.min_profit:
-            opportunity = _opportunity(snapshot, tier, space, basket)
+            opportunity = opportunity_from_basket(snapshot, tier, space, basket)
             apr = opportunity.apr
             if config.min_apr is not None and (apr is None or apr < config.min_apr):
                 continue
@@ -178,7 +186,7 @@ def classify_basket(
     return ArbKind.COMBO
 
 
-def _opportunity(
+def opportunity_from_basket(
     snapshot: EventSnapshot, tier: Tier, space: OutcomeSpace, basket: VerifiedBasket
 ) -> Opportunity:
     event = snapshot.structure.event

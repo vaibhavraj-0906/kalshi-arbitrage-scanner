@@ -20,9 +20,14 @@ async def test_demo_reproduces_the_guide(tmp_path: Path) -> None:
     summary = await run_demo(path)
     assert (summary.cycles, summary.trades, summary.settlement.settled) == (3, 2, 2)
     assert summary.realized == Cash.parse("-6.46")
+    # The simulated account agrees with the attribution to the cent, and so do its settlement
+    # records; no audit halted trading.
+    assert summary.balance == Cash.parse("10000") + summary.realized
+    assert summary.settlement.exchange_checked == 2 and summary.settlement.exchange_mismatches == []
+    assert summary.halted is None
 
     with RecordStore(path) as store:
-        trades = {trade.group_key: trade for trade in store.paper_trades()}
+        trades = {trade.group_key: trade for trade in store.trades()}
         ladder, winner = trades["DEMO-LADDER"], trades["DEMO-WINNER"]
         assert (ladder.kind, ladder.planned_pnl, ladder.realized_pnl) == (
             "MONOTONE",
@@ -35,6 +40,9 @@ async def test_demo_reproduces_the_guide(tmp_path: Path) -> None:
             -11_680_000,
         )
         assert (winner.worst_after_hedge, winner.realized_pnl) == (-8_420_000, -8_420_000)
+        # Buying YES on A and B closed the NO already held there: $100 back at execution.
+        assert (winner.netted_cash, winner.balance_change) == (100_000_000, -8_420_000)
+        assert (ladder.netted_cash, ladder.balance_change) == (0, -28_040_000)
         assert not any(trade.model_violation for trade in trades.values())
 
         opportunities = store.opportunities(LIVE_SOURCE, summary.run_id)

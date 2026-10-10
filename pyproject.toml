@@ -12,6 +12,7 @@ dependencies = [
     "typer>=0.15.0",
     "rich>=13.9.0",
     "duckdb>=1.5.0",
+    "cryptography>=44.0.0",
 ]
 
 [project.optional-dependencies]

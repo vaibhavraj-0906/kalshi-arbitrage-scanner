@@ -4,8 +4,8 @@ from datetime import UTC, datetime
 
 from karb.core.fixed import Cash, Price, Qty
 from karb.market.book import Side
-from karb.paper.settle import MarketResult, holdings, market_result, settlement_payout
-from karb.store.database import PaperOrderRow
+from karb.store.database import TradeOrderRow
+from karb.trading.settle import MarketResult, holdings, market_result, settlement_payout
 from karb.wire.models import MarketWire
 
 SETTLED = datetime(2026, 10, 1, tzinfo=UTC)
@@ -53,8 +53,8 @@ def test_payout_waits_for_every_market_to_be_final() -> None:
 
 
 def test_holdings_sum_entry_and_hedge_fills_only() -> None:
-    def order(phase: str, ticker: str, side: str, filled: int) -> PaperOrderRow:
-        return PaperOrderRow("T1", phase, 0, ticker, side, 6000, filled, filled, 0, 0, "[]")
+    def order(phase: str, ticker: str, side: str, filled: int) -> TradeOrderRow:
+        return TradeOrderRow("T1", phase, 0, ticker, side, 6000, filled, filled, 0, 0, "[]")
 
     rows = [
         order("plan", "A", "no", 5000),

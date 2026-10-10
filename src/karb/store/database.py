@@ -3,7 +3,7 @@
 Conventions follow tengine's market-data store. Money is exact integers -- prices in $0.0001,
 quantities in 0.01 contracts, cash in $0.000001 -- never ``DOUBLE``. Timestamps are integer
 nanoseconds since the epoch. The ``DOUBLE`` columns are diagnostics, never money: the LP's
-pre-rounding objective and a paper trade's fill ratio.
+pre-rounding objective.
 
 Rows are written in bulk as one JSON document unpacked by DuckDB's ``from_json``. Parameter
 binding is the obvious alternative and is unusable here: on DuckDB 1.5, ``executemany`` took
@@ -39,23 +39,24 @@ __all__ = [
     "SCHEMA_VERSION",
     "ObservationRow",
     "OpportunityRow",
-    "PaperOrderRow",
-    "PaperSessionRow",
-    "PaperTradeRow",
     "RecordStore",
     "RunInfo",
+    "SessionRow",
     "SettlementRow",
     "StoreError",
+    "TradeOrderRow",
+    "TradeRow",
     "new_id",
 ]
 
-SCHEMA_VERSION: Final = 2
-"""v1: recordings and replays (Milestone 2). v2 adds paper trading and settlements."""
+SCHEMA_VERSION: Final = 3
+"""v1: recordings and replays (Milestone 2). v2 adds paper trading and settlements. v3 replaces
+the paper tables with trade tables that also hold what the exchange said (ADR-0010)."""
 
 LIVE_SOURCE: Final = "live"
 """The ``source`` of rows the scanner recorded itself. Saved replays use their replay id."""
 
-_PAPER_TABLES: Final = ("paper_sessions", "paper_trades", "paper_orders", "settlements")
+_TRADE_TABLES: Final = ("trade_sessions", "trades", "trade_orders", "settlements")
 _TABLES: Final = (
     "runs",
     "cycles",
@@ -66,7 +67,7 @@ _TABLES: Final = (
     "solver_results",
     "opportunities",
     "replays",
-    *_PAPER_TABLES,
+    *_TRADE_TABLES,
 )
 
 _SCHEMA: Final = """
@@ -174,8 +175,19 @@ CREATE TABLE IF NOT EXISTS replays (
     config       VARCHAR NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS paper_sessions (
-    paper_id     VARCHAR PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS settlements (
+    ticker     VARCHAR PRIMARY KEY,
+    status     VARCHAR NOT NULL,
+    result     VARCHAR NOT NULL,
+    yes_value  INTEGER,
+    settled_ns BIGINT,
+    fetched_ns BIGINT  NOT NULL
+);
+"""
+
+_TRADE_SCHEMA: Final = """
+CREATE TABLE IF NOT EXISTS trade_sessions (
+    session_id   VARCHAR PRIMARY KEY,
     run_id       VARCHAR NOT NULL,
     kind         VARCHAR NOT NULL,
     created_ns   BIGINT  NOT NULL,
@@ -183,9 +195,9 @@ CREATE TABLE IF NOT EXISTS paper_sessions (
     config       VARCHAR NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS paper_trades (
+CREATE TABLE IF NOT EXISTS trades (
     trade_id          VARCHAR PRIMARY KEY,
-    paper_id          VARCHAR NOT NULL,
+    session_id        VARCHAR NOT NULL,
     run_id            VARCHAR NOT NULL,
     cycle_no          INTEGER NOT NULL,
     group_key         VARCHAR NOT NULL,
@@ -210,31 +222,62 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     settled_ns        BIGINT,
     payout            BIGINT,
     realized_pnl      BIGINT,
-    model_violation   BOOLEAN
+    model_violation   BOOLEAN,
+    netted_cash       BIGINT,
+    balance_change    BIGINT
 );
 
-CREATE TABLE IF NOT EXISTS paper_orders (
-    trade_id    VARCHAR NOT NULL,
-    phase       VARCHAR NOT NULL,
-    seq         INTEGER NOT NULL,
-    ticker      VARCHAR NOT NULL,
-    side        VARCHAR NOT NULL,
-    limit_price INTEGER NOT NULL,
-    ordered     BIGINT  NOT NULL,
-    filled      BIGINT  NOT NULL,
-    cash_out    BIGINT  NOT NULL,
-    fees        BIGINT  NOT NULL,
-    fills       VARCHAR NOT NULL
+CREATE TABLE IF NOT EXISTS trade_orders (
+    trade_id        VARCHAR NOT NULL,
+    phase           VARCHAR NOT NULL,
+    seq             INTEGER NOT NULL,
+    ticker          VARCHAR NOT NULL,
+    side            VARCHAR NOT NULL,
+    limit_price     INTEGER NOT NULL,
+    ordered         BIGINT  NOT NULL,
+    filled          BIGINT  NOT NULL,
+    cash_out        BIGINT  NOT NULL,
+    fees            BIGINT  NOT NULL,
+    fills           VARCHAR NOT NULL,
+    client_order_id VARCHAR,
+    order_id        VARCHAR,
+    model_fees      BIGINT,
+    error           VARCHAR,
+    response        VARCHAR
 );
+"""
 
-CREATE TABLE IF NOT EXISTS settlements (
-    ticker     VARCHAR PRIMARY KEY,
-    status     VARCHAR NOT NULL,
-    result     VARCHAR NOT NULL,
-    yes_value  INTEGER,
-    settled_ns BIGINT,
-    fetched_ns BIGINT  NOT NULL
-);
+_PAPER_COLUMNS: Final = """trade_id, paper_id, run_id, cycle_no, group_key, event_ticker,
+    opportunity_id, kind, tier, decided_ns, entry_ns, hedge_ns, planned_cost, planned_pnl,
+    entry_cost, worst_after_entry, hedge_cost, worst_after_hedge, best_after_hedge,
+    planned_contracts, filled_contracts, status, note, settled_ns, payout, realized_pnl,
+    model_violation"""
+_PAPER_ORDER_FIELDS: Final = """trade_id, phase, seq, ticker, side, limit_price, ordered, filled,
+    cash_out, fees, fills"""
+
+_MIGRATE_V2: Final = f"""
+INSERT INTO trade_sessions
+    SELECT paper_id, run_id, kind, created_ns, karb_version, config FROM paper_sessions;
+INSERT INTO trades SELECT {_PAPER_COLUMNS}, NULL, NULL FROM paper_trades;
+INSERT INTO trade_orders SELECT {_PAPER_ORDER_FIELDS}, NULL, NULL, NULL, NULL, NULL
+    FROM paper_orders;
+DROP TABLE paper_orders;
+DROP TABLE paper_trades;
+DROP TABLE paper_sessions;
+"""
+
+_LEGACY_VIEWS: Final = f"""
+CREATE TEMP VIEW trade_sessions AS
+    SELECT paper_id AS session_id, run_id, kind, created_ns, karb_version, config
+    FROM paper_sessions;
+CREATE TEMP VIEW trades AS
+    SELECT {_PAPER_COLUMNS.replace("paper_id", "paper_id AS session_id")},
+           NULL::BIGINT AS netted_cash, NULL::BIGINT AS balance_change
+    FROM paper_trades;
+CREATE TEMP VIEW trade_orders AS
+    SELECT {_PAPER_ORDER_FIELDS}, NULL::VARCHAR AS client_order_id, NULL::VARCHAR AS order_id,
+           NULL::BIGINT AS model_fees, NULL::VARCHAR AS error, NULL::VARCHAR AS response
+    FROM paper_orders;
 """
 
 _OBSERVATION_COLUMNS: Final = (
@@ -294,9 +337,9 @@ _OPPORTUNITY_COLUMNS: Final = (
     ("contracts", "BIGINT"),
     ("legs", "VARCHAR"),
 )
-_PAPER_TRADE_COLUMNS: Final = (
+_TRADE_COLUMNS: Final = (
     ("trade_id", "VARCHAR"),
-    ("paper_id", "VARCHAR"),
+    ("session_id", "VARCHAR"),
     ("run_id", "VARCHAR"),
     ("cycle_no", "INTEGER"),
     ("group_key", "VARCHAR"),
@@ -322,8 +365,10 @@ _PAPER_TRADE_COLUMNS: Final = (
     ("payout", "BIGINT"),
     ("realized_pnl", "BIGINT"),
     ("model_violation", "BOOLEAN"),
+    ("netted_cash", "BIGINT"),
+    ("balance_change", "BIGINT"),
 )
-_PAPER_ORDER_COLUMNS: Final = (
+_TRADE_ORDER_COLUMNS: Final = (
     ("trade_id", "VARCHAR"),
     ("phase", "VARCHAR"),
     ("seq", "INTEGER"),
@@ -335,6 +380,11 @@ _PAPER_ORDER_COLUMNS: Final = (
     ("cash_out", "BIGINT"),
     ("fees", "BIGINT"),
     ("fills", "VARCHAR"),
+    ("client_order_id", "VARCHAR"),
+    ("order_id", "VARCHAR"),
+    ("model_fees", "BIGINT"),
+    ("error", "VARCHAR"),
+    ("response", "VARCHAR"),
 )
 _SETTLEMENT_COLUMNS: Final = (
     ("ticker", "VARCHAR"),
@@ -403,22 +453,23 @@ class OpportunityRow:
 
 
 @dataclass(frozen=True, slots=True)
-class PaperSessionRow:
-    paper_id: str
+class SessionRow:
+    session_id: str
     run_id: str
     kind: str
-    """``live`` (traded while scanning) or ``replay`` (simulated over a recording)."""
+    """``demo`` (orders on Kalshi's demo exchange), ``simulated`` (orders on a local simulated
+    exchange), or, from recordings made before ADR-0010, ``live`` and ``replay`` paper trading."""
     created_ns: int
     karb_version: str
     config: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
-class PaperTradeRow:
-    """One paper trade and its P&L attribution, in raw exact units (ADR-0008)."""
+class TradeRow:
+    """One trade and its P&L attribution, in raw exact units (ADR-0008, ADR-0010)."""
 
     trade_id: str
-    paper_id: str
+    session_id: str
     run_id: str
     cycle_no: int
     group_key: str
@@ -439,13 +490,17 @@ class PaperTradeRow:
     planned_contracts: int
     filled_contracts: int
     status: str
-    """``open`` (holding to settlement), ``flat`` (nothing filled), ``missed`` (no arrival
-    book), or ``settled``."""
+    """``open`` (holding to settlement), ``flat`` (nothing filled), ``settled``, or ``missed``
+    (paper trades from before ADR-0010 that saw no arrival book)."""
     note: str
     settled_ns: int | None = None
     payout: int | None = None
     realized_pnl: int | None = None
     model_violation: bool | None = None
+    netted_cash: int | None = None
+    """Cash the exchange returned at once by netting YES against NO in the same market."""
+    balance_change: int | None = None
+    """How the account balance moved across the trade, as the exchange reported it."""
 
     @property
     def total_cost(self) -> int:
@@ -453,7 +508,7 @@ class PaperTradeRow:
 
 
 @dataclass(frozen=True, slots=True)
-class PaperOrderRow:
+class TradeOrderRow:
     trade_id: str
     phase: str
     """``plan`` (the basket as decided), ``entry`` or ``hedge``."""
@@ -465,8 +520,16 @@ class PaperOrderRow:
     filled: int
     cash_out: int
     fees: int
+    """For an exchange order, the fees the exchange charged."""
     fills: str
-    """Exact fills as JSON: price, qty, trade fee, rounding fee and rebate per level."""
+    """Exact fills as JSON: price, qty, trade fee, rounding fee and rebate per fill."""
+    client_order_id: str | None = None
+    order_id: str | None = None
+    model_fees: int | None = None
+    """karb's fee model applied to the same fills."""
+    error: str | None = None
+    response: str | None = None
+    """The exchange's response to the order, as JSON."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,7 +544,7 @@ class SettlementRow:
 
 
 class RecordStore:
-    """A DuckDB file of recorded runs and paper trades."""
+    """A DuckDB file of recorded runs and trades."""
 
     __slots__ = ("_connection", "path", "read_only", "schema_version")
 
@@ -505,11 +568,32 @@ class RecordStore:
         self._connection: duckdb.DuckDBPyConnection = connection
         try:
             if not read_only:
+                self._migrate_v2()
                 self._connection.execute(_SCHEMA)
+                self._connection.execute(_TRADE_SCHEMA)
             self._check_schema()
+            if read_only and self.schema_version == 2:
+                self._connection.execute(_LEGACY_VIEWS)
         except BaseException:
             self._connection.close()
             raise
+
+    def _migrate_v2(self) -> None:
+        """Move a v2 file's paper tables into the v3 trade tables, keeping every row."""
+        import duckdb
+
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+        except duckdb.Error:
+            return  # a new file, or not a recording; _check_schema decides which
+        if row is None or int(row[0]) != 2:
+            return
+        with self.transaction():
+            self._connection.execute(_TRADE_SCHEMA)
+            self._connection.execute(_MIGRATE_V2)
+            self._connection.execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'")
 
     def _check_schema(self) -> None:
         import duckdb
@@ -533,7 +617,8 @@ class RecordStore:
                 f"{self.path} holds schema v{version}; this karb reads up to v{SCHEMA_VERSION}"
             )
         if version < SCHEMA_VERSION and not self.read_only:
-            # Every version so far only adds tables, which _SCHEMA has just created.
+            # v1 only lacks tables, which the schema scripts have just created; v2 was migrated
+            # before they ran.
             self._connection.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'", [str(SCHEMA_VERSION)]
             )
@@ -541,7 +626,7 @@ class RecordStore:
         self.schema_version = version
 
     @property
-    def has_paper_tables(self) -> bool:
+    def has_trade_tables(self) -> bool:
         return self.schema_version >= 2
 
     # ---- lifecycle ------------------------------------------------------------------------------
@@ -724,13 +809,13 @@ class RecordStore:
             [replay_id, run_id, created_ns, karb_version, json.dumps(config, sort_keys=True)],
         )
 
-    # ---- writing: paper trading -----------------------------------------------------------------
+    # ---- writing: trading ------------------------------------------------------------------------
 
-    def insert_paper_session(self, session: PaperSessionRow) -> None:
+    def insert_session(self, session: SessionRow) -> None:
         self._connection.execute(
-            "INSERT INTO paper_sessions VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trade_sessions VALUES (?, ?, ?, ?, ?, ?)",
             [
-                session.paper_id,
+                session.session_id,
                 session.run_id,
                 session.kind,
                 session.created_ns,
@@ -739,12 +824,12 @@ class RecordStore:
             ],
         )
 
-    def insert_paper_trade(self, trade: PaperTradeRow, orders: Sequence[PaperOrderRow]) -> None:
+    def insert_trade(self, trade: TradeRow, orders: Sequence[TradeOrderRow]) -> None:
         with self.transaction():
-            self._insert_rows("paper_trades", _PAPER_TRADE_COLUMNS, [astuple(trade)])
-            self._insert_rows("paper_orders", _PAPER_ORDER_COLUMNS, [astuple(o) for o in orders])
+            self._insert_rows("trades", _TRADE_COLUMNS, [astuple(trade)])
+            self._insert_rows("trade_orders", _TRADE_ORDER_COLUMNS, [astuple(o) for o in orders])
 
-    def settle_paper_trade(
+    def settle_trade(
         self,
         trade_id: str,
         *,
@@ -755,7 +840,7 @@ class RecordStore:
     ) -> None:
         self._connection.execute(
             """
-            UPDATE paper_trades
+            UPDATE trades
             SET status = 'settled', settled_ns = ?, payout = ?, realized_pnl = ?,
                 model_violation = ?
             WHERE trade_id = ?
@@ -948,61 +1033,58 @@ class RecordStore:
     def table_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for table in _TABLES:
-            if table in _PAPER_TABLES and not self.has_paper_tables:
+            if table in _TRADE_TABLES and not self.has_trade_tables:
                 counts[table] = 0
                 continue
             row = self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
             counts[table] = 0 if row is None else int(row[0])
         return counts
 
-    # ---- reading: paper trading -----------------------------------------------------------------
+    # ---- reading: trading ------------------------------------------------------------------------
 
-    def paper_sessions(self) -> list[PaperSessionRow]:
-        if not self.has_paper_tables:
+    def sessions(self) -> list[SessionRow]:
+        if not self.has_trade_tables:
             return []
         rows = self._connection.execute(
             """
-            SELECT paper_id, run_id, kind, created_ns, karb_version, config
-            FROM paper_sessions ORDER BY created_ns, paper_id
+            SELECT session_id, run_id, kind, created_ns, karb_version, config
+            FROM trade_sessions ORDER BY created_ns, session_id
             """
         ).fetchall()
         return [
-            PaperSessionRow(row[0], row[1], row[2], row[3], row[4], json.loads(row[5]))
-            for row in rows
+            SessionRow(row[0], row[1], row[2], row[3], row[4], json.loads(row[5])) for row in rows
         ]
 
-    def paper_trades(
-        self, *, paper_id: str | None = None, status: str | None = None
-    ) -> list[PaperTradeRow]:
-        if not self.has_paper_tables:
+    def trades(self, *, session_id: str | None = None, status: str | None = None) -> list[TradeRow]:
+        if not self.has_trade_tables:
             return []
-        names = ", ".join(name for name, _ in _PAPER_TRADE_COLUMNS)
+        names = ", ".join(name for name, _ in _TRADE_COLUMNS)
         clauses: list[str] = []
         params: list[object] = []
-        if paper_id is not None:
-            clauses.append("paper_id = ?")
-            params.append(paper_id)
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
         if status is not None:
             clauses.append("status = ?")
             params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._connection.execute(
-            f"SELECT {names} FROM paper_trades {where} ORDER BY decided_ns, trade_id", params
+            f"SELECT {names} FROM trades {where} ORDER BY decided_ns, trade_id", params
         ).fetchall()
-        return [PaperTradeRow(*row) for row in rows]
+        return [TradeRow(*row) for row in rows]
 
-    def paper_orders(self, trade_id: str) -> list[PaperOrderRow]:
-        if not self.has_paper_tables:
+    def trade_orders(self, trade_id: str) -> list[TradeOrderRow]:
+        if not self.has_trade_tables:
             return []
-        names = ", ".join(name for name, _ in _PAPER_ORDER_COLUMNS)
+        names = ", ".join(name for name, _ in _TRADE_ORDER_COLUMNS)
         rows = self._connection.execute(
-            f"SELECT {names} FROM paper_orders WHERE trade_id = ? ORDER BY phase, seq",
+            f"SELECT {names} FROM trade_orders WHERE trade_id = ? ORDER BY phase, seq",
             [trade_id],
         ).fetchall()
-        return [PaperOrderRow(*row) for row in rows]
+        return [TradeOrderRow(*row) for row in rows]
 
     def settlements(self, tickers: Sequence[str]) -> dict[str, SettlementRow]:
-        if not self.has_paper_tables or not tickers:
+        if not self.has_trade_tables or not tickers:
             return {}
         names = ", ".join(name for name, _ in _SETTLEMENT_COLUMNS)
         # A list bound as a parameter is slow to convert (see the module docstring); JSON is not.

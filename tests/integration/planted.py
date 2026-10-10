@@ -1,9 +1,10 @@
 """A mock Kalshi exchange: the recorded S&P range event plus a planted three-way overround.
 
 The planted event's YES bids sum to $1.20, so buying NO on all three locks in $7.48 on 50
-contracts each (see tests/unit/test_detect.py for the arithmetic). Paper-trading tests can thin
-chosen markets on "arrival" -- requests for nothing but planted markets, which only the paper
-trader makes -- and serve settlement results.
+contracts each (see tests/unit/test_detect.py for the arithmetic). Behind ``/portfolio`` sits a
+``SimulatedDesk`` that verifies signatures, matches orders against these books and keeps an
+account. Trading tests can thin chosen markets the moment the first planted order lands, and
+serve settlement results.
 """
 
 from __future__ import annotations
@@ -12,19 +13,28 @@ import asyncio
 import json
 import random
 from collections.abc import Callable
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 import httpx
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from karb.arb.detect import DetectConfig
 from karb.core.clock import FakeClock
 from karb.exchange.client import KalshiClient
 from karb.scanner.service import CycleReport, ScanConfig, Scanner
 from karb.store.database import RecordStore
 from karb.store.recorder import Recorder
+from karb.trading.auth import Credentials
+from karb.trading.engine import Trader
+from karb.trading.plan import TradeConfig
+from karb.trading.simulator import SimulatedDesk
 from tests.support import FIXTURES, captured_at
 
-BASE = "https://kalshi.test/trade-api/v2"
+HOST = "kalshi.test"
+BASE = f"https://{HOST}/trade-api/v2"
+CREDENTIALS = Credentials("test-key-id", Ed25519PrivateKey.generate())
 CLOSE = "2026-10-01T00:00:00Z"
 PLANTED = ("PLANT-1-A", "PLANT-1-B", "PLANT-1-C")
 
@@ -89,30 +99,57 @@ class PlantedExchange:
                 },
             }
         self.thin_on_arrival = thin_on_arrival
+        """Markets whose YES bids someone takes just before the first planted order lands."""
         self.results = results or {}
         """ticker -> (status, result) served by GET /markets?tickers=..."""
-        self.arrival_fetches = 0
         self.failing_event_calls = failing_event_calls
         """1-based numbers of GET /events calls that fail as if DNS were down."""
         self.event_calls = 0
+        self.clock = FakeClock(captured_at())
+        self._raced = False
+        self.desk = SimulatedDesk(
+            ladders={ticker: entry["orderbook_fp"] for ticker, entry in self.books.items()},
+            clock=self.clock,
+            fee_rate=lambda _ticker: Fraction(7, 100),
+            public_key=CREDENTIALS.public_key(),
+            key_id=CREDENTIALS.key_id,
+            results={
+                t: result for t, (status, result) in self.results.items() if status == "finalized"
+            },
+            on_order=self._race,
+        )
 
-    def _book(self, ticker: str, *, arriving: bool) -> dict[str, Any]:
-        book = self.books[ticker]
-        if arriving and ticker in self.thin_on_arrival:
-            # Someone took every YES bid, so NO can no longer be bought here.
-            return {
-                "ticker": ticker,
-                "orderbook_fp": {**book["orderbook_fp"], "yes_dollars": []},
-            }
-        return book
+    def _race(self, ticker: str) -> None:
+        if ticker in PLANTED and not self._raced:
+            self._raced = True
+            for thin in self.thin_on_arrival:
+                # Someone took every YES bid, so NO can no longer be bought here.
+                self.books[thin]["orderbook_fp"]["yes_dollars"] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         endpoint = request.url.path.split("/trade-api/v2", 1)[1]
+        if endpoint.startswith("/portfolio/"):
+            return self.desk.handle(request, endpoint)
         payload: object
         if endpoint == "/exchange/status":
             payload = raw("exchange_status.json")
         elif endpoint == "/series":
             payload = {"series": self.series}
+        elif endpoint.startswith("/events/"):
+            wanted_event = endpoint.removeprefix("/events/")
+            found = [e for e in self.events if e["event_ticker"] == wanted_event]
+            if not found:
+                return httpx.Response(404, content=b"no such event")
+            payload = {"event": found[0]}
+        elif endpoint.startswith("/markets/") and endpoint != "/markets/orderbooks":
+            ticker = endpoint.removeprefix("/markets/")
+            if ticker not in self.books:
+                return httpx.Response(404, content=b"no such market")
+            event_ticker = "PLANT-1" if ticker in PLANTED else ticker.rsplit("-", 1)[0]
+            payload = {"market": {"ticker": ticker, "event_ticker": event_ticker}}
+        elif endpoint.startswith("/series/"):
+            wanted_series = endpoint.removeprefix("/series/")
+            payload = {"series": next(s for s in self.series if s["ticker"] == wanted_series)}
         elif endpoint == "/events":
             self.event_calls += 1
             if self.event_calls in self.failing_event_calls:
@@ -120,11 +157,7 @@ class PlantedExchange:
             payload = {"events": self.events, "cursor": ""}
         elif endpoint == "/markets/orderbooks":
             wanted = request.url.params.get_list("tickers")
-            arriving = set(wanted) <= set(PLANTED)
-            self.arrival_fetches += int(arriving)
-            payload = {
-                "orderbooks": [self._book(t, arriving=arriving) for t in wanted if t in self.books]
-            }
+            payload = {"orderbooks": [self.books[t] for t in wanted if t in self.books]}
         elif endpoint == "/markets":
             tickers = request.url.params.get("tickers", "").split(",")
             payload = {
@@ -148,8 +181,11 @@ class PlantedExchange:
         return httpx.Response(200, content=json.dumps(payload).encode())
 
 
-def make_client(exchange: PlantedExchange) -> tuple[KalshiClient, Callable[[float], Any]]:
-    clock = FakeClock(captured_at())
+def make_client(
+    exchange: PlantedExchange, *, signed: bool = False
+) -> tuple[KalshiClient, Callable[[float], Any]]:
+    """A client on the exchange's clock; ``signed`` ones carry the test credentials."""
+    clock = exchange.clock
 
     async def sleep(seconds: float) -> None:
         clock.advance(seconds)
@@ -161,6 +197,8 @@ def make_client(exchange: PlantedExchange) -> tuple[KalshiClient, Callable[[floa
         clock=clock,
         sleep=sleep,
         rng=random.Random(1),
+        credentials=CREDENTIALS if signed else None,
+        sign_hosts=frozenset({HOST}),
     )
     return client, sleep
 
@@ -194,3 +232,50 @@ async def record_scan(
             await scanner.run_once(on_cycle=handle)
         recorder.finish_run()
     return run_id
+
+
+async def trade_live(
+    path: Path,
+    exchange: PlantedExchange,
+    *,
+    config: TradeConfig | None = None,
+    stop_file: Path | None = None,
+    confirmations: int = 2,
+    reports: list[CycleReport] | None = None,
+) -> Trader:
+    """Record a scan of ``exchange`` while a trader sends real orders to its desk."""
+    scanning, sleep = make_client(exchange)
+    trading, _ = make_client(exchange, signed=True)
+    store = RecordStore(path)
+    recorder = Recorder(store, scanning.clock)
+    async with scanning, trading:
+        scanner = Scanner(
+            scanning,
+            ScanConfig(watchlist_size=10, confirmations=confirmations),
+            sleep=sleep,
+            record_payloads=True,
+        )
+        run_id = recorder.start_run(scanner.config)
+        trader = Trader(
+            trading,
+            store,
+            run_id=run_id,
+            detect_config=DetectConfig(),
+            config=config or TradeConfig(),
+            environment="simulated",
+            stop_file=stop_file,
+        )
+
+        def handle(report: CycleReport) -> None:
+            cycle_no = recorder.record_cycle(
+                report, payloads=scanner.event_payloads, series=scanner.series
+            )
+            trader.consider(report, cycle_no)
+            if reports is not None:
+                reports.append(report)
+
+        await scanner.run_once(on_cycle=handle)
+        await trader.drain()
+    recorder.finish_run()
+    store.close()
+    return trader
